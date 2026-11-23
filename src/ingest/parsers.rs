@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone)]
 pub struct Row { pub date: String, pub amount: f64, pub currency: String, pub description: String, pub value_date: Option<String>, pub counterparty: String, pub reference: Option<String>, pub raw: Map<String, Value>, pub line: usize }
 #[derive(Debug, Clone)]
-pub struct Parsed { pub format: &'static str, pub rows: Vec<Row>, pub iban: Option<String>, pub currency: Option<String>, pub warnings: Vec<String> }
+pub struct Parsed { pub format: &'static str, pub rows: Vec<Row>, pub iban: Option<String>, pub currency: Option<String>, pub warnings: Vec<String>, pub balance: Option<(String, f64)> }
 
 /// utf-8 (with or without BOM) first, then cp1252.
 pub fn decode(data: &[u8], encoding: &str) -> Result<String> {
@@ -103,7 +103,7 @@ pub fn parse_csv(data: &[u8], p: &Profile) -> Result<Parsed> {
     }
     if !bad.is_empty() { bail!("{} unreadable row(s), nothing imported: {}{}", bad.len(), bad[..bad.len().min(5)].join("; "), if bad.len() > 5 { format!("; ... {} more", bad.len() - 5) } else { String::new() }); }
     if rows.is_empty() { bail!("no transaction rows found (check the profile: header, skip_rows, filter)"); }
-    Ok(Parsed { format: "csv", rows, iban: None, currency: None, warnings: vec![] })
+    Ok(Parsed { format: "csv", rows, iban: None, currency: None, warnings: vec![], balance: None })
 }
 /// Python `re.sub(r"\s+", " ", s)` (no strip).
 fn collapse_ws(s: &str) -> String { rs!(r"\s+").replace_all(s, " ").into() }
@@ -134,7 +134,7 @@ pub fn parse_ofx(data: &[u8]) -> Result<Parsed> {
     }
     if !bad.is_empty() { bail!("{} unreadable transaction(s), nothing imported: {}", bad.len(), bad[..bad.len().min(5)].join("; ")); }
     let iban = iban.map(|i| i.replace(' ', "")).filter(|i| is(re!(r"^[A-Z]{2}\d{2}"), i));
-    Ok(Parsed { format: "ofx", rows, iban, currency: cur, warnings: vec![] })
+    Ok(Parsed { format: "ofx", rows, iban, currency: cur, warnings: vec![], balance: None })
 }
 
 fn child<'a>(n: roxmltree::Node<'a, 'a>, path: &str) -> Option<roxmltree::Node<'a, 'a>> { path.split('/').try_fold(n, |n, p| n.children().find(|c| c.is_element() && c.tag_name().name() == p)) }
@@ -179,7 +179,7 @@ pub fn parse_camt053(data: &[u8]) -> Result<Parsed> {
     if ibans.len() > 1 { warnings.push(format!("the file holds statements of several accounts: {}", ibans.join(", "))); }
     if rows.is_empty() { bail!("no booked entries found in the CAMT.053 file"); }
     let iban = (ibans.len() == 1 && is(re!(r"^[A-Z]{2}\d{2}"), &ibans[0])).then(|| ibans[0].replace(' ', ""));
-    Ok(Parsed { format: "camt053", rows, iban, currency: None, warnings })
+    Ok(Parsed { format: "camt053", rows, iban, currency: None, warnings, balance: None })
 }
 
 // ---------------------------------------------------------------- CODA (Belgian bank statement file, 128-column records)
@@ -189,7 +189,7 @@ fn coda_date(s: &str) -> Option<String> { let (dd, mm, yy): (u32, u32, i32) = (s
 /// TO VERIFY WITH A REAL FILE: field positions follow the published CODA 2 layout.
 pub fn parse_coda(data: &[u8]) -> Result<Parsed> {
     let text = decode(data, "auto")?;
-    let (mut rows, mut iban, mut currency, mut warnings) = (Vec::<Row>::new(), None::<String>, None::<String>, vec![]);
+    let (mut rows, mut iban, mut currency, mut warnings, mut balance) = (Vec::<Row>::new(), None::<String>, None::<String>, vec![], None::<(String, f64)>);
     let f = |c: &[char], a: usize, b: usize| c.get(a..b.min(c.len())).map_or(String::new(), |x| x.iter().collect::<String>());
     let mut cur: Option<(Row, String, String, String)> = None; // (row, communication, structured ref, name)
     let flush = |cur: &mut Option<(Row, String, String, String)>, rows: &mut Vec<Row>| if let Some((mut r, comm, sref, name)) = cur.take() {
@@ -217,14 +217,15 @@ pub fn parse_coda(data: &[u8]) -> Result<Parsed> {
             }
             ('2', '2') => if let Some(x) = cur.as_mut() { if x.2.is_empty() { x.1.push_str(&f(&c, 10, 63)); } },
             ('2', '3') => if let Some(x) = cur.as_mut() { x.3 = f(&c, 47, 82); if x.2.is_empty() { x.1.push_str(&f(&c, 82, 125)); } let acc = f(&c, 10, 47); if !acc.trim().is_empty() { x.0.raw.insert("counterparty_account".into(), Value::from(acc.trim())); } },
-            ('8', _) | ('9', _) => flush(&mut cur, &mut rows),
+            ('8', _) => { flush(&mut cur, &mut rows); let v: Option<f64> = f(&c, 42, 57).trim().parse::<f64>().ok().map(|x| x / 1000.0); if let (Some(v), Some(dd)) = (v, coda_date(&f(&c, 57, 63))) { balance = Some((dd, if f(&c, 41, 42) == "1" { -v } else { v })); } }
+            ('9', _) => flush(&mut cur, &mut rows),
             _ => {}
         }
     }
     flush(&mut cur, &mut rows);
     if rows.is_empty() { bail!("no movements found in the CODA file"); }
     if iban.as_deref().is_some_and(|i| !is(re!(r"^[A-Z]{2}\d{2}"), i)) { warnings.push("the CODA account number is not an IBAN: the account check is skipped".into()); iban = None; }
-    Ok(Parsed { format: "coda", rows, iban, currency, warnings })
+    Ok(Parsed { format: "coda", rows, iban, currency, warnings, balance })
 }
 
 pub fn detect_format(name: &str, data: &[u8]) -> Result<&'static str> {
@@ -262,11 +263,11 @@ mod tests {
             rec(&[(1, "21"), (3, "0001"), (7, "0000"), (32, "1"), (33, "000000000012340"), (48, "130325"), (54, "00150000"), (62, "1"), (63, "101123456789012"), (116, "140325")]),
             rec(&[(1, "23"), (3, "0001"), (7, "0000"), (11, "BE12345678901234"), (48, "PROXIMUS NV")]),
             rec(&[(1, "21"), (3, "0002"), (7, "0000"), (32, "0"), (33, "000000002500000"), (48, "150325"), (62, "0"), (63, "LOON MAART"), (116, "150325")]),
-            rec(&[(1, "8")]), rec(&[(1, "9")])].join("\n");
+            rec(&[(1, "8"), (42, "0"), (43, "000000001234560"), (58, "150325")]), rec(&[(1, "9")])].join("\n");
         assert_eq!(detect_format("x.txt", lines.as_bytes()).unwrap(), "coda");
         let p = parse_coda(lines.as_bytes()).unwrap();
         assert_eq!(p.iban.as_deref(), Some("BE68539007547034")); assert_eq!(p.rows.len(), 2);
         assert_eq!((p.rows[0].date.as_str(), p.rows[0].amount, p.rows[0].description.as_str()), ("2025-03-14", -12.34, "PROXIMUS NV | +++123/4567/89012+++"));
-        assert_eq!((p.rows[1].amount, p.rows[1].description.as_str()), (2500.0, "LOON MAART"));
+        assert_eq!((p.rows[1].amount, p.rows[1].description.as_str()), (2500.0, "LOON MAART")); assert_eq!(p.balance, Some(("2025-03-15".into(), 1234.56)));
     }
 }
