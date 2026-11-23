@@ -90,7 +90,11 @@ pub fn import_file(con: &Connection, path: &Path, o: ImportOpts) -> Result<Impor
                 params![key, uid, r.reference, r.date, r.value_date, r.amount, r.currency, r.counterparty, r.description, serde_json::Value::Object(raw).to_string(), ts, ts])?;
             if n > 0 { con.execute("INSERT INTO import_rows VALUES (?,?)", params![key, id])?; ins += 1; }
         }
-        con.execute("UPDATE imports SET rows_new=? WHERE id=?", params![ins as i64, id])?; Ok(ins)
+        con.execute("UPDATE imports SET rows_new=? WHERE id=?", params![ins as i64, id])?;
+        // a statement's closing balance (CODA record 8) is the account's balance on that day, unless a later one is stored
+        if let Some((dd, v)) = &parsed.balance { if con.query_row("SELECT 1 FROM balances WHERE account_uid=? AND fetched_at>=?", params![uid, dd], |_| Ok(())).optional()?.is_none() {
+            con.execute("INSERT INTO balances(account_uid, fetched_at, balance_type, amount, currency, reference_date) VALUES (?,?, 'CLBD', ?,?,?)", params![uid, dd, v, rows[0].currency, dd])?; rep.warnings.push(format!("closing balance {v:.2} on {dd} stored")); } }
+        Ok(ins)
     })();
     match res { Ok(n) => { con.execute_batch("COMMIT")?; rep.rows_new = n; rep.rows_duplicate = rows.len() - n; Ok(rep) } Err(e) => { let _ = con.execute_batch("ROLLBACK"); Err(e) } }
 }

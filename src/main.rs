@@ -1,7 +1,7 @@
 //! `finch`: the command line. Local output keeps raw values; only the MCP server redacts (it talks to a model).
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use finch::{analytics::{self, averages::category_averages, cashflow::cashflow, Dataset, Scope}, classify, config, db, ingest::{self, accounts, profiles}, mcp, secrets};
+use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, rules::Rules}, config, db, ingest::{self, accounts, profiles}, mcp, secrets, transfers};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -33,6 +33,25 @@ enum Cmd {
     /// Usual monthly spending per category
     Averages { #[arg(long)] window: Option<usize>, #[command(flatten)] scope: ScopeArgs, #[command(flatten)] out: Out },
     #[command(subcommand)] Mcp(McpCmd),
+    #[command(subcommand)] Transfers(TrCmd),
+    /// Recurring payments and income
+    Recurring { /// store the detection (recurring_series table)
+        #[arg(long)] refresh: bool, #[arg(long)] active: bool, #[command(flatten)] scope: ScopeArgs, #[command(flatten)] out: Out },
+    /// Price changes of recurring payments
+    PriceChanges { #[arg(long)] since: Option<String>, #[arg(long)] confirmed: bool, #[command(flatten)] scope: ScopeArgs, #[command(flatten)] out: Out },
+    /// Unusual spending (spikes, duplicates, new merchants, large payments)
+    Anomalies { /// store them (anomalies table)
+        #[arg(long)] refresh: bool, /// dismiss an anomaly by id (it stays dismissed)
+        #[arg(long)] dismiss: Option<String>, #[arg(long)] note: Option<String>, #[command(flatten)] scope: ScopeArgs, #[command(flatten)] out: Out },
+    /// Cash-flow forecast of the balances
+    Forecast { #[arg(long, default_value_t = 90)] days: i64, #[command(flatten)] scope: ScopeArgs, #[command(flatten)] out: Out },
+    #[command(subcommand)] Budgets(BudCmd),
+    /// Savings goals and their progress
+    Goals(Out),
+    /// Upcoming payments and deadlines
+    Calendar { #[arg(long)] days: Option<usize>, #[arg(long)] transfers: bool, #[command(flatten)] out: Out },
+    /// Recompute and store recurring series and anomalies, and list transfer proposals (the daily job)
+    Refresh,
 }
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
@@ -40,6 +59,14 @@ enum Cmd {
 #[derive(Subcommand)] enum AccCmd { /// List accounts
     List, /// Set label / owner / purpose / exclusion of an account
     Set { ident: String, #[arg(long)] label: Option<String>, #[arg(long)] owner: Option<String>, #[arg(long)] purpose: Option<String>, #[arg(long)] exclude: bool, #[arg(long)] include: bool, #[arg(long)] resolve: bool } }
+#[derive(Subcommand)] enum TrCmd { /// Find internal-transfer pairs (proposals only, unless --link)
+    Match { #[arg(long)] link: bool }, /// Stored links
+    List, /// Link a debit and a credit by hand
+    Link { out_key: String, in_key: String, #[arg(long)] allow_amount_mismatch: bool }, /// Remove a link (the pair is never proposed again)
+    Unlink { reference: String } }
+#[derive(Subcommand)] enum BudCmd { /// This month's progress of every budget (memory/budgets.yaml)
+    Status { #[arg(long)] as_of: Option<String>, #[command(flatten)] out: Out }, /// Suggested budgets from recent months
+    Suggest { #[arg(long)] months: Option<usize>, #[arg(long)] limit: Option<usize>, #[command(flatten)] out: Out } }
 #[derive(Subcommand)] enum McpCmd { /// Serve the finance tools over stdio (for Claude Code: `.mcp.json`)
     Serve, /// List the tools and their schemas
     Tools }
@@ -71,6 +98,9 @@ const SHIPPED_PROFILES: [(&str, &str); 3] = [("generic-csv-be-nl", include_str!(
 fn scope(s: &ScopeArgs) -> Scope { let one = |x: &Option<String>| x.clone().map(|v| [v].into()); Scope { accounts: one(&s.account), owners: one(&s.owner), purposes: one(&s.purpose) } }
 fn print_json(v: &Value) { println!("{}", serde_json::to_string_pretty(v).unwrap()); }
 fn s(v: &Value) -> String { v.as_str().map(String::from).unwrap_or_else(|| if v.is_null() { "-".into() } else { v.to_string() }) }
+fn lines(v: &Value, key: &str, f: impl Fn(&Value) -> String) { for x in v[key].as_array().into_iter().flatten() { println!("{}", f(x)); } }
+fn notes(v: &Value) { for n in v["coverage"]["notes"].as_array().into_iter().flatten() { println!("note: {}", s(n)); } }
+fn date_arg(x: &Option<String>) -> Result<Option<chrono::NaiveDate>> { x.as_deref().map(|v| finch::util::d(v).ok_or_else(|| anyhow::anyhow!("{v:?} is not a date (YYYY-MM-DD)"))).transpose() }
 fn rate(v: &Value) -> String { v.as_f64().map_or("-".into(), |r| format!("{:.1}%", r * 100.0)) }
 
 fn main() {
@@ -109,6 +139,39 @@ fn run() -> Result<()> {
             for u in v["unavailable"].as_array().unwrap() { println!("{:<36}  unavailable: {}", s(&u["category"]), s(&u["reason"])); }
             for n in v["coverage"]["notes"].as_array().unwrap() { println!("note: {}", s(n)); } } }
         Cmd::Mcp(McpCmd::Serve) => mcp::serve(mcp::Session::open(cfg, cli.insecure)?)?,
+        Cmd::Transfers(t) => { let con = open(true)?; let o = transfers::Opts::from(&cfg); let rules = Rules::load(&cfg)?; let (ann, _) = finch::memory::load_annotations(&cfg.memory_dir);
+            match t {
+                TrCmd::Match { link } => { let r = transfers::match_transfers(&con, &rules, &ann, &cfg.memory_dir, &o, link || cfg.transfer_auto_link)?; println!("{}", transfers::format_result(&r, link || cfg.transfer_auto_link)); }
+                TrCmd::List => { let l = transfers::list_links(&con)?; if l.is_empty() { println!("no transfer links (run `finch transfers match`)"); } for x in l { println!("{:>4} {:>10.2} {:>5.2} {:<7} {:<24} -> {:<24} {} / {}", s(&x["id"]), x["amount"].as_f64().unwrap_or(0.0), x["confidence"].as_f64().unwrap_or(0.0), s(&x["method"]), s(&x["out_account"]), s(&x["in_account"]), s(&x["out_date"]), s(&x["in_date"])); } }
+                TrCmd::Link { out_key, in_key, allow_amount_mismatch } => println!("linked #{}", transfers::link(&con, &out_key, &in_key, allow_amount_mismatch)?),
+                TrCmd::Unlink { reference } => { let (id, ..) = transfers::unlink(&con, &reference)?; println!("removed link #{id}; the pair will not be proposed again"); }
+            } }
+        Cmd::Recurring { refresh, active, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
+            if refresh { println!("{}", recurring::refresh(&con, &ds)?); return Ok(()); }
+            let r = recurring::detect(&ds, &scope(&sc), !active); if out.json { print_json(&r.json); return Ok(()); }
+            println!("{:<15}{:<7}{:<11}{:<34}{:>11}{:>11}  {:<11}{}", "id", "status", "cadence", "entity", "amount", "per year", "next", "category");
+            for x in &r.series { println!("{:<15}{:<7}{:<11}{:<34}{:>11}{:>11}  {:<11}{}", x.id, x.status, x.cadence, finch::util::truncate_chars(&x.entity, 33), finch::util::money_str(x.expected_c), finch::util::money_str(x.yearly_c), x.next_expected.map_or("-".into(), |d| d.to_string()), x.category); }
+            notes(&r.json); }
+        Cmd::PriceChanges { since, confirmed, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &scope(&sc), true);
+            let dis: std::collections::HashSet<String> = con.prepare("SELECT id FROM price_change_dismissals")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let v = recurring::price_changes(&ds, &rec, date_arg(&since)?, confirmed, &dis, false); if out.json { print_json(&v); } else { lines(&v, "changes", |c| format!("{} {:<34} {:>10} -> {:<10} {:>7.1}%  {}/year  {}{}", s(&c["date"]), finch::util::truncate_chars(&s(&c["entity"]), 33), s(&c["old"]), s(&c["new"]), c["pct"].as_f64().unwrap_or(0.0) * 100.0, s(&c["yearly_impact"]), s(&c["effect"]), if c["confirmed"] == true { "" } else { " (unconfirmed)" })); } }
+        Cmd::Anomalies { refresh, dismiss, note, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &scope(&sc), true);
+            if let Some(id) = dismiss { anomalies::refresh(&con, &ds, &rec)?; println!("{}", if anomalies::dismiss(&con, &id, note.as_deref())? { format!("dismissed {id}") } else { format!("no anomaly {id}") }); return Ok(()); }
+            if refresh { println!("{}", anomalies::refresh(&con, &ds, &rec)?); return Ok(()); }
+            let v = anomalies::detect(&ds, &scope(&sc), &rec, &anomalies::dismissed_ids(&con)?, false); if out.json { print_json(&v); } else { lines(&v, "anomalies", |a| format!("{} {:<7} {}", s(&a["id"]), s(&a["severity"]), s(&a["message"]))); notes(&v); } }
+        Cmd::Forecast { days, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let v = planning::forecast(&ds, &rec, &scope(&sc), days, out.json); if out.json { print_json(&v); } else {
+            for b in std::iter::once(&v["household"]).chain(v["accounts"].as_array().unwrap()) { println!("{:<24} start {:>11}  {}  min {} on {}  flags: {}", s(&b["label"]), s(&b["start_balance"]), b["milestones"].as_array().unwrap().iter().map(|m| format!("{}d {}", s(&m["days"]), s(&m["balance"]))).collect::<Vec<_>>().join("  "), s(&b["min_balance"]), s(&b["min_date"]), b["flags"].as_array().unwrap().iter().map(s).collect::<Vec<_>>().join(", ")); }
+            lines(&v, "assumptions", |a| format!("assumption: {}", s(a))); } }
+        Cmd::Budgets(BudCmd::Status { as_of, out }) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let v = planning::status(&ds, &rec, date_arg(&as_of)?); if out.json { print_json(&v); } else {
+            lines(&v, "budgets", |b| format!("{:<24}{:<8}spent {:>10} of {:>10}  projected {:>10}  {}", s(&b["id"]), s(&b["status"]), s(&b["spent"]), s(&b["available"]), s(&b["projected"]), s(&b["target"]))); lines(&v, "warnings", |w| format!("warning: {}", s(w))); notes(&v); } }
+        Cmd::Budgets(BudCmd::Suggest { months, limit, out }) => { let ds = Dataset::load(&open(true)?, &cfg, None)?; let v = planning::suggest(&ds, &Scope::default(), months, limit); if out.json { print_json(&v); } else { lines(&v, "suggestions", |x| format!("{:<36}{:>10}/month  (median {}, {} months){}", s(&x["category"]), s(&x["suggested"]), s(&x["median"]), s(&x["n_months"]), if x["low_confidence"] == true { " low confidence" } else { "" })); } }
+        Cmd::Goals(out) => { let ds = Dataset::load(&open(true)?, &cfg, None)?; let v = planning::goals(&ds); if out.json { print_json(&v); } else { lines(&v, "goals", |g| format!("{:<20}{:<10}{:>10} of {:>10}  pace {}  projected {}", s(&g["id"]), s(&g["status"]), s(&g["current"]), s(&g["target"]), s(&g["pace"]), s(&g["projected_date"]))); notes(&v); } }
+        Cmd::Calendar { days, transfers, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let v = planning::calendar(&ds, &con, &rec, days, transfers); if out.json { print_json(&v); } else { lines(&v, "items", |i| format!("{} {:>4}d {:<9} {:<40} {:>10}", s(&i["date"]), s(&i["days_until"]), s(&i["source"]), finch::util::truncate_chars(&s(&i["title"]), 39), s(&i["amount"]))); } }
+        Cmd::Refresh => { let con = open(true)?; let rules = Rules::load(&cfg)?; let (ann, _) = finch::memory::load_annotations(&cfg.memory_dir);
+            let tr = transfers::match_transfers(&con, &rules, &ann, &cfg.memory_dir, &transfers::Opts::from(&cfg), cfg.transfer_auto_link)?;
+            let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true);
+            println!("transfers: {} {}, {} proposal(s), {} ambiguous", tr.linked.len(), if cfg.transfer_auto_link { "linked" } else { "auto-linkable (set [transfers] auto_link = true to link them)" }, tr.proposals.len(), tr.ambiguous.len());
+            println!("recurring: {}", recurring::refresh(&con, &ds)?); println!("anomalies: {}", anomalies::refresh(&con, &ds, &rec)?); }
         Cmd::Mcp(McpCmd::Tools) => { for t in mcp::tools() { println!("{}: {}", t.name, t.schema); } }
     }
     Ok(())

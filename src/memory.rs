@@ -52,3 +52,41 @@ pub fn members(memory_dir: &Path) -> Vec<Member> {
 pub fn household_list(memory_dir: &Path, field: &str) -> Vec<String> {
     household_yaml(Some(memory_dir)).get(field).and_then(|v| v.as_sequence()).map(|s| s.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
 }
+
+/// A contract (`merchant_match`) or liability (`payment_match`) pattern that links bank payments to a memory item.
+#[derive(Debug, Clone)]
+pub struct Matcher { pub kind: &'static str, pub id: String, pub pattern: String, pub amount: Option<(f64, f64)>, pub liability_kind: Option<String> }
+pub fn matchers(memory_dir: &Path) -> Vec<Matcher> {
+    let mut out = vec![];
+    for (dir, kind, field) in [("contracts", "contract", "merchant_match"), ("liabilities", "liability", "payment_match")] {
+        let mut files: Vec<_> = std::fs::read_dir(memory_dir.join(dir)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "yaml" || e == "yml") && !p.file_name().unwrap().to_string_lossy().starts_with('_')).collect();
+        files.sort();
+        for f in files {
+            let Some(v) = std::fs::read_to_string(&f).ok().and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok()) else { continue };
+            let (Some(id), Some(pat)) = (v.get("id").and_then(|x| x.as_str()), v.get(field).and_then(|x| x.as_str())) else { continue };
+            let amount = v.get("amount_match").and_then(|a| Some((a.get("amount")?.as_f64()?, a.get("tolerance_pct").and_then(|t| t.as_f64()).unwrap_or(3.0))));
+            out.push(Matcher { kind, id: id.into(), pattern: pat.into(), amount, liability_kind: v.get("kind").and_then(|k| k.as_str()).map(String::from).filter(|_| kind == "liability") });
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget { pub id: String, pub category: Option<String>, pub group: Option<String>, pub monthly: f64, #[serde(default)] pub rollover: bool, pub owner: Option<String>, pub account: Option<String>, pub start: Option<String>, pub note: Option<String> }
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Goal { pub id: String, pub title: Option<String>, pub target_amount: f64, pub target_date: Option<String>, pub asset: Option<String>, pub account: Option<String>, pub tag: Option<String>, pub monthly_contribution: Option<f64>, pub baseline: Option<f64>, pub start: Option<String>, pub note: Option<String> }
+
+/// Entries of a list file (budgets.yaml / goals.yaml): valid ones, and "id: why" for each invalid one (an invalid entry never stops the others).
+pub fn list_file<T: serde::de::DeserializeOwned>(memory_dir: &Path, file: &str, key: &str) -> (Vec<T>, Vec<String>) {
+    let Some(v) = std::fs::read_to_string(memory_dir.join(file)).ok().and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok()) else { return (vec![], vec![]) };
+    let (mut ok, mut bad) = (vec![], vec![]);
+    for (i, e) in v.get(key).and_then(|x| x.as_sequence()).cloned().unwrap_or_default().into_iter().enumerate() {
+        let mut e = e;
+        if let Some(m) = e.as_mapping_mut() { for (_, val) in m.iter_mut() { if let serde_yaml::Value::Tagged(t) = val { *val = t.value.clone(); } } }
+        let id = e.get("id").and_then(|x| x.as_str()).map_or(format!("#{}", i + 1), String::from);
+        match serde_yaml::from_value::<T>(e) { Ok(x) => ok.push(x), Err(err) => bad.push(format!("{id}: {err}")) }
+    }
+    (ok, bad)
+}
