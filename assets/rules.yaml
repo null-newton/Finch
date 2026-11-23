@@ -1,0 +1,91 @@
+# Deterministic rules, applied before memory and LLM labels. First match wins.
+# `type_rules` map the parsed operation type; `match` is a case-insensitive regex on the normalised merchant key
+# (upper case, digits removed: see `finch normalize`). Patterns are generic Belgian words and well-known brands, never a person.
+# Your own copy: config/rules.yaml (it replaces this one).
+type_rules:
+  atm: cash.atm_withdrawal
+  internal_transfer: transfer.internal
+  wero_out: transfer.to_people
+  wero_in: transfer.from_people
+  person_transfer_out: transfer.to_people
+  person_transfer_in: transfer.from_people
+  savings_internal: transfer.internal
+  topup: transfer.internal
+  fx_exchange: transfer.internal
+  bank_fee: fees.bank_fees
+  interest: income.interest
+  # A loan instalment is NOT a mortgage by default: neutral id, refined per account purpose and by memory annotations.
+  loan_payment: debt.loan_repayment
+
+# Overrides of type_rules for accounts of a given purpose (accounts.purpose, `finch accounts set --purpose`)
+type_rules_by_account_purpose:
+  rental:
+    loan_payment: housing.rental_property_loan
+
+merchant_rules:
+  # property tax comes BEFORE the generic tax rule: it is a cost of the property
+  # pay coming in: wages, pension, holiday pay, end-of-year bonus (generic payroll words, never an employer's name)
+  - match: '\b(LOON|LONEN|WEDDE|SALARIS|SALAIRE|TRAITEMENT|REMUNERATION|PENSIOEN|PENSION|VAKANTIEGELD|PECULE\s+DE\s+VACANCES|EINDEJAARSPREMIE|PRIME\s+DE\s+FIN\s+D\W?ANNEE|DERTIENDE\s+MAAND)\b'
+    direction: in
+    category: income.salary
+  - match: '\bONROERENDE\s+VOORHEFFING\b|\bPRECOMPTE\s+IMMOBILIER\b'
+    category: housing.property_tax
+  - match: '\bFOD\s+FINANCIEN\b|\bSPF\s+FINANCES\b|\bMYMINFIN\b|\bVLAAMSE\s+BELASTINGDIENST\b|\bVERKEERSBELASTING\b|\bTAXE\s+DE\s+CIRCULATION\b|\bSPW\s+FISCALITE\b|\bBRUXELLES\s+FISCALITE\b|\bBELASTINGEN?\b|\bIMPOTS?\b|\bGAS\s+BOETE\b'
+    category: taxes.taxes
+  - match: '\bSYNDIC(US)?\b|\bMEDE\s?EIGENDOM\b|\bCOPROPRIETE\b|\bVME\b|\bACP\b'
+    category: housing.property_charges
+  - match: '\bHUURBEHEER\b|\bVASTGOEDBEHEER\b|\bGESTION\s+LOCATIVE\b|\bBEHEERSKOSTEN\s+HUUR\b'
+    direction: out
+    category: housing.property_management
+  # rent received: HUUR / LOYER coming IN (a rental deposit or a refund is not rent)
+  - match: '^(?!.*\b(WAARBORG|HUURWAARBORG|GARANTIE|TERUGBETALING|REMBOURSEMENT)\b).*\b(HUUR|HUURGELD|LOYER)\b'
+    direction: in
+    category: income.rental
+  # mutualities: a reimbursement coming in, the yearly contribution / hospitalisation cover going out
+  - match: '\bMUTUALITEIT\b|\bMUTUALITES?\b|\bZIEKENFONDS\b|\bSOLIDARIS\b|\bHELAN\b|\bPARTENA\s+ZIEKENFONDS\b'
+    direction: in
+    category: income.refund
+  - match: '\bMUTUALITEIT\b|\bMUTUALITES?\b|\bZIEKENFONDS\b|\bSOLIDARIS\b|\bHELAN\b|\bPARTENA\s+ZIEKENFONDS\b|\bDKV\b|\bHOSPITALISATIE\b'
+    direction: out
+    category: health.health_insurance
+  - match: '\bGROEIPAKKET\b|\bKINDERBIJSLAG\b|\bALLOCATIONS?\s+FAMILIALES\b|\bFAMIWAL\b|\bFAMIRIS\b|\bINFINO\b|\bKIDSLIFE\b|\bPARENTIA\b|\bMYFAMILY\b|\bOPGROEIEN\b|\bRVA\b|\bONEM\b|\bRIZIV\b|\bINAMI\b|\bHVW\b|\bCAPAC\b'
+    direction: in
+    category: income.benefits
+  - match: '\bDIENSTENCHEQUES?\b|\bTITRES?\s+SERVICES?\b|\bPLURALITY\b'
+    category: housing.household_help
+  - match: '\bKINDEROPVANG\b|\bKINDERDAGVERBLIJF\b|\bCRECHE\b|\bBUITENSCHOOLSE\s+OPVANG\b'
+    category: kids.childcare
+  # utilities
+  - match: '\bENGIE\b|\bELECTRABEL\b|\bLUMINUS\b|\bTOTALENERGIES\s+POWER\b|\bBOLT\s+ENERGIE\b|\bENECO\b|\bFLUVIUS\b|\bORES\b|\bSIBELGA\b|\bRESA\b|\bESSENT\b|\bDATS\s+ENERGIE\b|\bWASE\s+WIND\b'
+    category: housing.energy
+  - match: '\bWATERGROEP\b|\bPIDPA\b|\bFARYS\b|\bWATER\s?LINK\b|\bVIVAQUA\b|\bSWDE\b|\bINBW\b|\bAQUAFIN\b'
+    category: housing.water
+  - match: '\bPROXIMUS\b|\bTELENET\b|\bORANGE\s+BELGIUM\b|\bSCARLET\b|\bVOO\b|\bMOBILE\s?VIKINGS\b|\bBASE\s+COMPANY\b|\bEDPNET\b|\bYOUFONE\b|\bDIGI\b|\bLYCAMOBILE\b'
+    category: subscriptions.telecom
+  # transport
+  - match: '\bNMBS\b|\bSNCB\b|\bDE\s?LIJN\b|\bSTIB\b|\bMIVB\b|\bTEC\b'
+    category: transport.public_transport
+  - match: '\bINTERPARKING\b|\bQ\s?PARK\b|\bINDIGO\b|\bSEEPARK\b|\bBE\s?MOBILE\b|\bPAYBYPHONE\b|\bPARKING\b'
+    category: transport.parking_tolls
+  - match: '\bDATS\b|\bQ\b|\bESSO\b|\bSHELL\b|\bLUKOIL\b|\bGABRIELS\b|\bOCTA\b|\bTOTAL\b|\bPOWERDOT\b|\bALLEGO\b|\bIONITY\b|\bFASTNED\b|\bBLUE\s+CORNER\b|\bTESLA\s+SUPERCHARG\w*'
+    category: transport.fuel
+  # groceries and pharmacies: national chains
+  - match: '\bCOLRUYT\b|\bDELHAIZE\b|\bCARREFOUR\b|\bALDI\b|\bLIDL\b|\bSPAR\b|\bOKAY\b|\bBONI\b|\bBIOPLANET\b|\bINTERMARCHE\b|\bCORA\b|\bJUMBO\b|\bALBERT\s+HEIJN\b'
+    category: food.groceries
+  - match: '\bAPOTHEEK\b|\bPHARMACIE\b|\bMULTIPHARMA\b'
+    category: health.pharmacy
+  - match: '\bDELIVEROO\b|\bUBER\s+EATS\b|\bTAKEAWAY\b'
+    category: food.food_delivery
+  # subscriptions and other brands
+  - match: '\bNETFLIX\b'
+    category: subscriptions.video_streaming
+  - match: '\bSPOTIFY\b'
+    category: subscriptions.music_streaming
+  - match: '\bAMAZON\s+PRIME\b'
+    category: subscriptions.memberships
+  - match: '\bDISNEY\s?PLUS\b|\bDISNEYPLUS\b|\bSTREAMZ\b|\bGOPLAY\b|\bVRT\s?MAX\b'
+    category: subscriptions.video_streaming
+  - match: '\bKLARNA\b|\bALMA\b|\bSCALAPAY\b|\bRIVERTY\b|\bAFTERPAY\b'
+    category: debt.bnpl
+  - match: '\bLEETCHI\b|\bKOM\s+OP\s+TEGEN\s+KANKER\b|\bARTSEN\s+ZONDER\s+GRENZEN\b|\bMEDECINS\s+SANS\s+FRONTIERES\b|\bRODE\s+KRUIS\b|\bCROIX\s+ROUGE\b|\bUNICEF\b|\bOXFAM\b'
+    category: charity.donations

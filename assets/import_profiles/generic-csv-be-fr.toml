@@ -1,0 +1,17 @@
+# Generic Belgian bank CSV in French: "Date;Description;Montant" (semicolon, dd/mm/yyyy, decimal comma).
+# TEMPLATE, TO VERIFY WITH A REAL EXPORT (see generic-csv-be-nl.toml for how to adapt it). CODA files need no profile.
+name = "generic-csv-be-fr"
+description = "Generic Belgian CSV (French headers): Date;Description;Montant, dd/mm/yyyy, decimal comma (template, to verify)"
+
+[format]
+encoding = "auto"
+delimiter = ";"
+header_contains = ["Date", "Montant"]
+date_format = ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]
+decimal = ","
+currency = "EUR"
+
+[columns]
+date = "Date"
+description = "Description"
+amount = "Montant"

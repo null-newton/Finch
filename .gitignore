@@ -1,0 +1,15 @@
+/target/
+/data/
+/memory/
+/backups/
+/config/
+config.toml
+*.db
+*.db-*
+*.bak
+secrets/
+hygiene-terms*
+web/node_modules/
+web/dist/
+.claude/settings.local.json
+/static/

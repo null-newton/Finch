@@ -1,0 +1,19 @@
+# Generic Belgian bank CSV in Dutch: "Datum;Omschrijving;Bedrag" (semicolon, dd/mm/yyyy, decimal comma).
+# TEMPLATE, TO VERIFY WITH A REAL EXPORT: copy it and rename the columns to your bank's header line, or let
+#   finch import FILE --account new:Label --date-col Datum --desc-col Omschrijving --amount-col Bedrag --save-profile my-bank
+# write the mapping for you. Column names are matched ignoring case and accents. CODA files need no profile.
+name = "generic-csv-be-nl"
+description = "Generic Belgian CSV (Dutch headers): Datum;Omschrijving;Bedrag, dd/mm/yyyy, decimal comma (template, to verify)"
+
+[format]
+encoding = "auto"
+delimiter = ";"
+header_contains = ["Datum", "Bedrag"]
+date_format = ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]
+decimal = ","
+currency = "EUR"
+
+[columns]
+date = "Datum"
+description = "Omschrijving"
+amount = "Bedrag"

@@ -1,0 +1,57 @@
+[package]
+name = "finch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Personal finance coach for one household: local, private, numbers from code (Rust port of ai-finance-coach)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "finch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "finch"
+path = "src/main.rs"
+
+[features]
+default = []
+# SQLCipher encryption of the database (needs perl + a C toolchain to build the vendored OpenSSL)
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+# OS secret store (macOS Keychain, Windows Credential Manager, Linux Secret Service)
+keychain = ["dep:keyring"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+encoding_rs = "0.8"
+fancy-regex = "0.14"
+hex = "0.4"
+keyring = { version = "3", optional = true, features = ["apple-native", "windows-native", "sync-secret-service"] }
+regex = "1"
+roxmltree = "0.20"
+rusqlite = { version = "0.32", features = ["bundled", "functions", "backup"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+unicode-normalization = "0.1"
+rand = "0.8"
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
