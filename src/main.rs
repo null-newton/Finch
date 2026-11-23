@@ -1,7 +1,7 @@
 //! `finch`: the command line. Local output keeps raw values; only the MCP server redacts (it talks to a model).
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, rules::Rules}, config, db, ingest::{self, accounts, profiles}, mcp, secrets, transfers};
+use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, profiles}, mcp, net, secrets, transfers};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -52,11 +52,41 @@ enum Cmd {
     Calendar { #[arg(long)] days: Option<usize>, #[arg(long)] transfers: bool, #[command(flatten)] out: Out },
     /// Recompute and store recurring series and anomalies, and list transfer proposals (the daily job)
     Refresh,
+    #[command(subcommand)] Classify(ClsCmd),
+    #[command(subcommand)] Bank(BankCmd),
+    /// Pull new transactions and balances from the connected banks
+    Sync { #[arg(long)] account: Option<String>, /// ask for the longest history again
+        #[arg(long)] full: bool, /// ignore the daily limit
+        #[arg(long)] force: bool },
+    /// The privacy mode and the last outbound calls (egress journal)
+    Privacy { #[arg(long, default_value_t = 20)] last: usize },
 }
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
     Status }
-#[derive(Subcommand)] enum AccCmd { /// List accounts
+#[derive(Subcommand)] enum ClsCmd { /// Label the merchants that need it: similarity first, then the LLM (redacted, person-like keys held back)
+    Run { /// print the exact redacted requests, send nothing
+        #[arg(long)] dry_run: bool, /// ask again for LLM / kNN labels too
+        #[arg(long)] refresh: bool, #[arg(long)] limit: Option<usize>, #[arg(long, default_value_t = 40)] batch: usize, #[arg(long)] model: Option<String>, #[arg(long)] no_knn: bool },
+    /// Merchants held back (possible people) and low-confidence labels
+    Review { #[command(flatten)] out: Out },
+    /// Your own label of a merchant key (always wins)
+    Correct { key: String, category: String, #[arg(long)] name: Option<String> } }
+#[derive(Subcommand)] enum BankCmd { /// Start a bank authorisation (opens the bank's login page)
+    Connect { #[arg(long)] bank: String, /// ISO country code of the bank (BE)
+        #[arg(long, default_value = "BE")] country: String, #[arg(long, default_value_t = 180)] days: i64, /// connect although a live consent exists
+        #[arg(long)] replace: bool, #[arg(long)] no_browser: bool },
+    /// Renew the consent of a connected bank (bank name or session id)
+    Reconnect { target: String, #[arg(long, default_value_t = 180)] days: i64, #[arg(long)] no_browser: bool },
+    /// Finish an authorisation with the address the browser shows after the bank login
+    Finish { url: Option<String>, /// store the saved answer of a failed completion again (no bank call)
+        #[arg(long)] replay: Option<String> },
+    /// Consents and their expiry
+    Consents { /// ask the bank for the live status first
+        #[arg(long)] refresh: bool } }
+#[derive(Subcommand)] enum AccCmd { /// Fold account NEW into OLD (after a reconnect created a duplicate)
+    Merge { old: String, new: String },
+    /// List accounts
     List, /// Set label / owner / purpose / exclusion of an account
     Set { ident: String, #[arg(long)] label: Option<String>, #[arg(long)] owner: Option<String>, #[arg(long)] purpose: Option<String>, #[arg(long)] exclude: bool, #[arg(long)] include: bool, #[arg(long)] resolve: bool } }
 #[derive(Subcommand)] enum TrCmd { /// Find internal-transfer pairs (proposals only, unless --link)
@@ -101,6 +131,14 @@ fn s(v: &Value) -> String { v.as_str().map(String::from).unwrap_or_else(|| if v.
 fn lines(v: &Value, key: &str, f: impl Fn(&Value) -> String) { for x in v[key].as_array().into_iter().flatten() { println!("{}", f(x)); } }
 fn notes(v: &Value) { for n in v["coverage"]["notes"].as_array().into_iter().flatten() { println!("note: {}", s(n)); } }
 fn date_arg(x: &Option<String>) -> Result<Option<chrono::NaiveDate>> { x.as_deref().map(|v| finch::util::d(v).ok_or_else(|| anyhow::anyhow!("{v:?} is not a date (YYYY-MM-DD)"))).transpose() }
+fn print_session(info: &Value) {
+    println!("Session {} with {} valid until {}", s(&info["session_id"]), s(&info["bank"]), s(&info["valid_until"]));
+    lines(info, "accounts", |a| format!("  account {}  {}{}{}", s(&a["uid"]), a["name"].as_str().unwrap_or(""), if a["remapped"] == true { format!("  (same account as before: new bank uid {}, history kept)", s(&a["api_uid"])) } else if a["new"] == true { "  (new)".into() } else { String::new() }, if a["needs_review"] == true { "  NEEDS REVIEW: not synced until `finch accounts merge OLD NEW` or `finch accounts set UID --resolve`" } else { "" }));
+    if info["retired"].as_array().is_some_and(|a| !a.is_empty()) { println!("Retired replaced session(s): {}", info["retired"]); }
+    if info["orphans"].as_array().is_some_and(|a| !a.is_empty()) { println!("warning: account(s) not returned by the new session, left on the retired one (not synced): {}", info["orphans"]); }
+    println!("\nNext: finch sync");
+}
+fn open_browser(url: &str) -> std::io::Result<std::process::Child> { if cfg!(windows) { std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn() } else if cfg!(target_os = "macos") { std::process::Command::new("open").arg(url).spawn() } else { std::process::Command::new("xdg-open").arg(url).spawn() } }
 fn rate(v: &Value) -> String { v.as_f64().map_or("-".into(), |r| format!("{:.1}%", r * 100.0)) }
 
 fn main() {
@@ -138,7 +176,7 @@ fn run() -> Result<()> {
             for c in v["categories"].as_array().unwrap() { println!("{:<36}{:>12}{:>14}{:>8}{}", s(&c["category"]), s(&c["monthly_avg"]), s(&c["monthly_avg_with_one_offs"]), s(&c["n_months"]), if c["low_confidence"] == true { "  (low confidence)" } else { "" }); }
             for u in v["unavailable"].as_array().unwrap() { println!("{:<36}  unavailable: {}", s(&u["category"]), s(&u["reason"])); }
             for n in v["coverage"]["notes"].as_array().unwrap() { println!("note: {}", s(n)); } } }
-        Cmd::Mcp(McpCmd::Serve) => mcp::serve(mcp::Session::open(cfg, cli.insecure)?)?,
+        Cmd::Mcp(McpCmd::Serve) => { if let Some(w) = egress::evaluate(&cfg, "mcp.finance", "") { anyhow::bail!("the finance MCP server does not start: {w}"); } mcp::serve(mcp::Session::open(cfg, cli.insecure)?)? }
         Cmd::Transfers(t) => { let con = open(true)?; let o = transfers::Opts::from(&cfg); let rules = Rules::load(&cfg)?; let (ann, _) = finch::memory::load_annotations(&cfg.memory_dir);
             match t {
                 TrCmd::Match { link } => { let r = transfers::match_transfers(&con, &rules, &ann, &cfg.memory_dir, &o, link || cfg.transfer_auto_link)?; println!("{}", transfers::format_result(&r, link || cfg.transfer_auto_link)); }
@@ -167,6 +205,39 @@ fn run() -> Result<()> {
         Cmd::Budgets(BudCmd::Suggest { months, limit, out }) => { let ds = Dataset::load(&open(true)?, &cfg, None)?; let v = planning::suggest(&ds, &Scope::default(), months, limit); if out.json { print_json(&v); } else { lines(&v, "suggestions", |x| format!("{:<36}{:>10}/month  (median {}, {} months){}", s(&x["category"]), s(&x["suggested"]), s(&x["median"]), s(&x["n_months"]), if x["low_confidence"] == true { " low confidence" } else { "" })); } }
         Cmd::Goals(out) => { let ds = Dataset::load(&open(true)?, &cfg, None)?; let v = planning::goals(&ds); if out.json { print_json(&v); } else { lines(&v, "goals", |g| format!("{:<20}{:<10}{:>10} of {:>10}  pace {}  projected {}", s(&g["id"]), s(&g["status"]), s(&g["current"]), s(&g["target"]), s(&g["pace"]), s(&g["projected_date"]))); notes(&v); } }
         Cmd::Calendar { days, transfers, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let v = planning::calendar(&ds, &con, &rec, days, transfers); if out.json { print_json(&v); } else { lines(&v, "items", |i| format!("{} {:>4}d {:<9} {:<40} {:>10}", s(&i["date"]), s(&i["days_until"]), s(&i["source"]), finch::util::truncate_chars(&s(&i["title"]), 39), s(&i["amount"]))); } }
+        Cmd::Accounts(AccCmd::Merge { old, new }) => println!("merged into {}", bank::merge_accounts(&open(true)?, &old, &new)?),
+        Cmd::Classify(c) => { let con = open(true)?; let rules = Rules::load(&cfg)?;
+            match c {
+                ClsCmd::Run { dry_run, refresh, limit, batch, model, no_knn } => {
+                    let (http, runner) = (net::UreqHttp::new(600), net::ProcessRunner);
+                    let be = (!dry_run).then(|| llm::Backend { name: cfg.llm_backend.clone(), cfg: &cfg, con: &con, t: if cfg.llm_backend == "claude-code" { llm::Transport::Run(&runner) } else { llm::Transport::Http(&http) } });
+                    if let Some(b) = &be { if let Some(w) = egress::evaluate(&cfg, &format!("llm.{}", b.name), &egress::host_of(if b.name == "ollama" { &cfg.llm_ollama_url } else { &cfg.llm_openai_base_url })) { anyhow::bail!("classify run is refused: {w}"); } }
+                    let r = llm::run(&con, &cfg, &rules, be.as_ref(), &llm::RunOpts { dry_run, refresh, limit, batch, model, knn: !no_knn })?;
+                    if !r.held_back.is_empty() { println!("{} merchant(s) held back from the LLM because they may be people (label them with `finch classify correct`; see `finch classify review`)", r.held_back.len()); }
+                    if r.knn > 0 { println!("{} merchant(s) {}labelled by similarity to labelled ones (no LLM)", r.knn, if dry_run { "would be " } else { "" }); }
+                    if let Some(p) = r.dry_payload { println!("DRY RUN: {} merchant(s) in {} request(s); nothing is sent, nothing is written.", r.sent, p.as_array().map_or(0, |a| a.len())); print_json(&p); }
+                    else { println!("labelled {}/{} merchants with {}; cost {}", r.labelled, r.sent, cfg.llm_backend, if r.unknown_cost { "unknown for this model".to_string() } else { format!("${:.3}{}", r.cost, if cfg.llm_backend == "claude-code" { " (notional on a subscription)" } else { " (estimate)" }) }); for f in &r.failed { println!("  FAILED {f}"); } if !r.failed.is_empty() { anyhow::bail!("{} batch(es) failed; the others were stored; run again to retry", r.failed.len()); } }
+                }
+                ClsCmd::Review { out } => { let v = llm::review(&con, &cfg, &rules)?; if out.json { print_json(&v); } else { println!("held back (possible people, never sent to an LLM):"); lines(&v, "held_back_person_like", |x| format!("  {:<40} {:>4} tx {:>10.2}", s(&x["key"]), s(&x["n"]), x["total"].as_f64().unwrap_or(0.0))); println!("low confidence / uncategorised:"); lines(&v, "low_confidence", |x| format!("  {:<40} {:<32} {} ({})", s(&x["key"]), s(&x["category"]), s(&x["confidence"]), s(&x["source"]))); } }
+                ClsCmd::Correct { key, category, name } => println!("labelled {key} as {category} ({} transaction(s))", llm::correct(&con, &rules, &key, &category, name.as_deref())?),
+            } }
+        Cmd::Bank(b) => { let con = open(true)?; let http = net::UreqHttp::new(60);
+            let finish = |cl: &bank::Client, state: &str| -> Result<()> { println!("\nAfter the bank login your browser lands on the redirect address (it may show an error page). Paste that whole address here and press Enter:"); let mut line = String::new(); std::io::stdin().read_line(&mut line)?; let (code, st) = bank::parse_finish_arg(cl.con, &line)?; if st.as_deref().is_some_and(|x| x != state) { anyhow::bail!("that address belongs to another authorisation"); } print_session(&bank::complete_auth(cl, &code, Some(st.as_deref().unwrap_or(state)))?); Ok(()) };
+            let open_url = |url: &str, no_browser: bool| { println!("Open this address to log in at your bank:\n  {url}"); if !no_browser { let _ = open_browser(url); } };
+            match b {
+                BankCmd::Connect { bank: name, country, days, replace, no_browser } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let (state, url) = bank::start_auth(&cl, &name, &country, days, None, replace)?; open_url(&url, no_browser); finish(&cl, &state)?; }
+                BankCmd::Reconnect { target, days, no_browser } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let c = bank::find_session(&con, &target)?; let (state, url) = bank::start_auth(&cl, &c.bank, &c.country, days, Some(&c.session_id), true)?; open_url(&url, no_browser); finish(&cl, &state)?; }
+                BankCmd::Finish { url, replay } => { if let Some(st) = replay { print_session(&bank::replay_auth(&con, &st)?); } else { let cl = bank::Client::from_config(&cfg, &con, &http)?; let (code, st) = bank::parse_finish_arg(&con, url.as_deref().ok_or_else(|| anyhow::anyhow!("give the redirect address, or --replay STATE"))?)?; print_session(&bank::complete_auth(&cl, &code, st.as_deref())?); } }
+                BankCmd::Consents { refresh } => { if refresh { let cl = bank::Client::from_config(&cfg, &con, &http)?; for n in bank::refresh_live(&cl)? { println!("{n}"); } } println!("{}", bank::format_consents(&bank::list_consents(&con, false)?)); }
+            } }
+        Cmd::Sync { account, full, force } => { let con = open(true)?; let http = net::UreqHttp::new(60); let cl = bank::Client::from_config(&cfg, &con, &http)?;
+            let res = bank::sync_all(&cl, account.as_deref(), full, force)?; let mut failed = 0;
+            for r in &res { match r["status"].as_str() { Some("ok") => println!("  {}: pages={} new={} pending={}{}", s(&r["uid"]), s(&r["pages"]), s(&r["new"]), s(&r["pending"]), if r["replaced_imports"].as_u64().unwrap_or(0) > 0 { format!(" replaced_imports={}", s(&r["replaced_imports"])) } else { String::new() }), Some("failed") => { failed += 1; println!("  {}: FAILED - {}", s(&r["uid"]), s(&r["note"])); } _ => println!("  {}{}", if r["uid"].is_null() { String::new() } else { format!("{}: ", s(&r["uid"])) }, s(&r["note"])) } }
+            if res.iter().any(|r| r["status"] == "ok" && r["new"].as_i64().unwrap_or(0) > 0) { println!("normalised {} transaction(s)", classify::normalize_all(&con, Some(&cfg.memory_dir))?); }
+            if failed > 0 { anyhow::bail!("{failed} account(s) failed (the others were synced)"); } }
+        Cmd::Privacy { last } => { println!("privacy mode: {}  (llm.backend {}, egress journal {})", egress::mode(&cfg), cfg.llm_backend, if cfg.privacy_egress_journal { "on" } else { "off" });
+            for f in egress::FLOWS { println!("  {:<24} {}", f.0, egress::evaluate(&cfg, f.0, if f.0 == "llm.ollama" { egress::host_of(&cfg.llm_ollama_url) } else { String::new() }.as_str()).unwrap_or_else(|| "allowed".into())); }
+            if let Ok(con) = open(true) { println!("last outbound calls:"); for (ts, k, h, b, p, o) in egress::journal(&con, last)? { println!("  {ts} {o:<8} {k:<22} {h:<28} {b:>7} B  {p}"); } } }
         Cmd::Refresh => { let con = open(true)?; let rules = Rules::load(&cfg)?; let (ann, _) = finch::memory::load_annotations(&cfg.memory_dir);
             let tr = transfers::match_transfers(&con, &rules, &ann, &cfg.memory_dir, &transfers::Opts::from(&cfg), cfg.transfer_auto_link)?;
             let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true);

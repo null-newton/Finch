@@ -2,6 +2,7 @@
 //! Dedup = multiset on the content fingerprint per account: re-importing a file adds 0, overlapping files add only the
 //! difference, and genuine same-day same-amount same-label purchases are kept.
 pub mod accounts;
+pub mod bank;
 pub mod fingerprint;
 pub mod parsers;
 pub mod profiles;

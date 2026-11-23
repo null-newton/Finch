@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 2)
+## Status (phase 3)
 
 | Area | State |
 |---|---|
@@ -16,7 +16,10 @@ Python app, so both can work on the same data while the port is in progress.
 | SQLCipher encryption | behind `--features sqlcipher` (see Build) |
 | File imports: CSV (profiles or an inline mapping), OFX/QFX, CAMT.053, **CODA**; multiset dedup, re-import adds nothing | ported |
 | Descriptor parsing: **Belgian banks** (NL / FR / EN), Revolut | new (replaces the French / Italian parsers) |
-| Categories: override, transfer link, type rules, user labels, Belgian merchant rules, entities, LLM labels, memory annotations, splits | ported (reads LLM labels, does not create them yet) |
+| Categories: override, transfer link, type rules, user labels, Belgian merchant rules, entities, LLM labels, memory annotations, splits | ported |
+| LLM classification of merchants: person guard (default deny), redaction, towns cut, coarse amounts, kNN near-duplicates without the LLM, backends `claude-code` / `anthropic-api` / `ollama` / `openai-compatible`, usage log, `--dry-run`, review, user corrections | ported (phase 3); the Batch API and web enrichment are not |
+| Enable Banking: RS256 JWT client, consents (expiry, live status), connect / reconnect / finish (paste the redirect address; `--replay`), account matching across reconnects, sync (pages, dedup, pending, balances, daily limit), account merge | ported (phase 3); no local HTTPS callback server |
+| Egress policy: one check before every outbound call, `[privacy] offline` / `local_only`, local journal (host and purpose only) | ported (phase 3) |
 | Analytics: coverage model, cash flow, category averages | ported (phase 1) |
 | Internal-transfer matching: auto-link (opt-in), proposals, ambiguous pairs, manual link / unlink, cross-bank window, member evidence | ported (phase 2) |
 | Recurring series (stored, stable ids), price changes, anomalies (spikes, duplicates, new merchants, large payments; dismissable) | ported (phase 2) |
@@ -26,10 +29,9 @@ Python app, so both can work on the same data while the port is in progress.
 | MCP server `finance` (stdio): `coverage`, `cashflow`, `category_averages`, `transactions_search`, `recurring`, `price_changes`, `anomalies`, `forecast`, `budget_status`, `budget_suggestions`, `calendar`, `goals` | ported |
 | Web app (`web/`) | copied unchanged; the Rust HTTP API that serves it is phase 2 |
 
-Not ported yet: LLM / kNN classification and review, Enable Banking sync (consent, JWT auth, callback) (phase 3); the web API
-(phase 4); memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth, rental property,
-alerts, household attribution, year review, quality / eval, backups and export (phase 5). Until then, use the Python app for them
-on the same database. Budgets and goals are read from `memory/`; writing them stays a memory proposal.
+Not ported yet: the web API (phase 4); memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth,
+rental property, alerts, household attribution, year review, quality / eval, backups and export (phase 5). Until then, use the Python app for
+them on the same database. Budgets and goals are read from `memory/`; writing them stays a memory proposal.
 
 ## Belgian banks
 
@@ -86,6 +88,12 @@ finch forecast --days 60
 finch budgets status
 finch calendar
 finch refresh                    # the daily analytics step
+finch bank connect --bank KBC     # log in at the bank, then paste the address the browser lands on
+finch sync                       # new transactions and balances (normalised automatically)
+finch classify run --dry-run     # the exact redacted requests; without --dry-run they are sent
+finch classify review            # held-back (possible people) and low-confidence merchants
+finch classify correct "SHOP KEY" food.groceries
+finch privacy                    # the privacy mode and the last outbound calls
 finch mcp serve
 ```
 
