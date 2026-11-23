@@ -61,6 +61,9 @@ enum Cmd {
     /// The privacy mode and the last outbound calls (egress journal)
     Privacy { #[arg(long, default_value_t = 20)] last: usize },
     /// Serve the web app on this machine and print a one-time login link
+    #[command(subcommand)] Household(HhCmd),
+    #[command(subcommand)] Memory(MemCmd),
+    #[command(subcommand)] Questions(QCmd),
     Ui { #[arg(long)] host: Option<String>, #[arg(long)] port: Option<u16>, /// API only: the page comes from `pnpm dev` (port 5173)
         #[arg(long)] dev: bool, #[arg(long)] no_browser: bool, /// print a fresh one-time login link for a running `finch ui` and exit
         #[arg(long)] login_link: bool, /// the login (`ui_users` id) the link opens; default the owner
@@ -71,6 +74,48 @@ enum Cmd {
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
     Status }
+#[derive(Subcommand)] enum MemCmd { /// Pending proposals (or --status all / accepted / rejected)
+    Proposals { #[arg(long, default_value = "pending")] status: String },
+    /// One proposal: what it changes, recomputed against the file as it is now
+    Show { id: String },
+    /// Apply a proposal after reading its diff (at a terminal, with a typed yes)
+    Accept { id: String, /// apply although the file changed since the proposal was made
+        #[arg(long)] force: bool, /// confirm a field flagged as coming from instruction-like text
+        #[arg(long = "confirm-field")] confirm_field: Vec<String> },
+    /// Close a proposal without applying it
+    Reject { id: String, #[arg(long)] note: Option<String> },
+    /// The change history of the memory folder
+    History { #[arg(long)] file: Option<String>, #[arg(long, default_value_t = 30)] limit: usize },
+    /// The patch of one recorded change
+    Diff { id: String },
+    /// Validate the memory files finch edits
+    Check }
+#[derive(Subcommand)] enum QCmd { /// Open questions (or --status answered / dismissed / all)
+    List { #[arg(long, default_value = "open")] status: String },
+    /// Ask a question yourself
+    Add { question: String, #[arg(long, default_value = "General")] topic: String },
+    /// Record an answer (turning it into memory changes is a separate step)
+    Answer { id: String, text: String },
+    Dismiss { id: String, #[arg(long)] reason: Option<String> },
+    Reopen { id: String } }
+#[derive(Subcommand)] enum HhCmd { /// Members, account owners, rules and how many transactions belong to whom
+    Overview { #[command(flatten)] out: Out },
+    /// The children's money: pocket money, extra top-ups and their source, spending, balance trend
+    Kids { member: Option<String>, #[arg(long, default_value_t = 6)] months: usize },
+    /// Kid budgets with this week's / month's progress
+    KidBudgets,
+    /// Shared costs split by the allocation rules: shares, what each paid, the settlement
+    WhoPays { #[arg(long, default_value_t = 12)] months: usize },
+    /// Whose a transaction is, and why
+    Explain { tx: String },
+    /// Reassign a transaction to a member (or joint) by hand; recorded and reversible
+    Assign { tx: String, member: String, #[arg(long)] note: Option<String> },
+    /// Remove a manual reassignment
+    Clear { tx: String },
+    /// The recorded manual reassignments, newest first
+    Log { #[arg(long)] tx: Option<String>, #[arg(long, default_value_t = 50)] limit: i64 },
+    /// Undo one recorded reassignment
+    Undo { id: i64 } }
 #[derive(Subcommand)] enum ClsCmd { /// Label the merchants that need it: similarity first, then the LLM (redacted, person-like keys held back)
     Run { /// print the exact redacted requests, send nothing
         #[arg(long)] dry_run: bool, /// ask again for LLM / kNN labels too
@@ -242,6 +287,50 @@ fn run() -> Result<()> {
             for r in &res { match r["status"].as_str() { Some("ok") => println!("  {}: pages={} new={} pending={}{}", s(&r["uid"]), s(&r["pages"]), s(&r["new"]), s(&r["pending"]), if r["replaced_imports"].as_u64().unwrap_or(0) > 0 { format!(" replaced_imports={}", s(&r["replaced_imports"])) } else { String::new() }), Some("failed") => { failed += 1; println!("  {}: FAILED - {}", s(&r["uid"]), s(&r["note"])); } _ => println!("  {}{}", if r["uid"].is_null() { String::new() } else { format!("{}: ", s(&r["uid"])) }, s(&r["note"])) } }
             if res.iter().any(|r| r["status"] == "ok" && r["new"].as_i64().unwrap_or(0) > 0) { println!("normalised {} transaction(s)", classify::normalize_all(&con, Some(&cfg.memory_dir))?); }
             if failed > 0 { anyhow::bail!("{failed} account(s) failed (the others were synced)"); } }
+        Cmd::Memory(m) => { let st = finch::memstore::Store::new(&cfg, "cli")?;
+            match m {
+                MemCmd::Proposals { status } => { let ps = finch::proposals::listing(&st, Some(&status)); if ps.is_empty() { println!("no {status} proposal"); }
+                    for p in ps { println!("{}  {:<9} {:<22} {} op(s)  by {}  {}", p.id, p.status, p.file, p.ops.len(), p.source, p.reason.chars().take(70).collect::<String>()); } }
+                MemCmd::Show { id } => { let p = finch::proposals::get(&st, &id)?; let v = finch::proposals::public(&st, &p);
+                    println!("{} ({}) on {}\nreason: {}\nproposed by: {}\nsealed: {}{}\n\n{}", p.id, s(&v["status"]), p.file, p.reason, p.source, s(&v["sealed"]), v["error"].as_str().map(|e| format!("\nNOT APPLICABLE: {e}")).unwrap_or_default(), s(&v["diff"])); }
+                MemCmd::Accept { id, force, confirm_field } => { use std::io::{IsTerminal, Write};
+                    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { bail!("accepting a proposal is a human action: run it in an interactive terminal"); }
+                    let (p, res, sealed, stale) = finch::proposals::preview(&st, &id)?;
+                    println!("{} on {}\nreason: {}\nproposed by: {}{}{}\n\n{}", p.id, p.file, p.reason, p.source, if sealed { "" } else { "\nWARNING: the proposal was modified after it was created: it will be refused" }, if stale { "\nWARNING: the file changed since the proposal was made" } else { "" }, res.diff);
+                    for w in &res.warnings { println!("warning: {w}"); }
+                    print!("Apply this change to {}? Type yes: ", p.file); std::io::stdout().flush()?; let mut line = String::new(); std::io::stdin().read_line(&mut line)?;
+                    if line.trim() != "yes" { println!("not applied"); return Ok(()); }
+                    let (p, res) = finch::proposals::accept(&st, &id, true, force, "cli", &confirm_field)?; println!("accepted {} ({})", p.id, res.change_id.unwrap_or_else(|| "no history".into())); }
+                MemCmd::Reject { id, note } => { let p = finch::proposals::reject(&st, &id, note.as_deref())?; println!("rejected {}", p.id); }
+                MemCmd::History { file, limit } => for c in st.repo().log(file.as_deref(), limit)? { println!("{}  {}  {:<10} {}{}", c.id, &c.date[..c.date.len().min(19)], c.source.unwrap_or_default(), c.subject, c.reason.map(|r| format!("  ({r})")).unwrap_or_default()); },
+                MemCmd::Diff { id } => print!("{}", st.repo().diff(&id)?),
+                MemCmd::Check => { let mut bad = 0; for (f, _) in finch::memstore::FILES { if !st.exists(f) { continue; } match st.validate(f, &st.read_text(f)) { Ok(w) => { println!("  ok       {f}"); for x in w { println!("  warning  {x}"); } } Err(e) => { bad += 1; println!("  ERROR    {e}"); } } }
+                    if finch::questions::md_hand_edited(&st) { println!("  warning  open-questions.md differs from open-questions.yaml"); } if bad > 0 { bail!("{bad} file(s) are invalid"); } }
+            } }
+        Cmd::Questions(q) => { let st = finch::memstore::Store::new(&cfg, "cli")?; let today = chrono::Local::now().date_naive();
+            let done = |r: finch::memstore::EditResult| { if r.changed() { print!("{}", r.diff); } else { println!("nothing changed"); } };
+            match q {
+                QCmd::List { status } => for x in finch::questions::listing(&st, (status != "all").then_some(status.as_str())) { println!("{}", finch::questions::render_line(&x)); },
+                QCmd::Add { question, topic } => { let (id, r) = finch::questions::add(&st, &question, &topic, today, false)?; println!("added {id}"); done(r); }
+                QCmd::Answer { id, text } => done(finch::questions::answer(&st, &id, &text, today, false)?),
+                QCmd::Dismiss { id, reason } => done(finch::questions::dismiss(&st, &id, reason.as_deref(), today, false)?),
+                QCmd::Reopen { id } => done(finch::questions::reopen(&st, &id, false)?),
+            } }
+        Cmd::Household(h) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
+            match h {
+                HhCmd::Overview { out } => { let v = finch::household::overview(&ds, &con)?; if out.json { print_json(&v); } else {
+                    lines(&v, "members", |m| format!("  {:<12} {:<6} {:>5} tx  accounts: {}", s(&m["id"]), s(&m["role"]), s(&m["attributed_transactions"]), m["accounts"].as_array().map_or(String::new(), |a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))));
+                    lines(&v, "accounts", |a| format!("  account {:<24} owner {:<10} {}", s(&a["label"]), a["owner"].as_str().unwrap_or("?"), a["attributed"]));
+                    println!("  attribution rules: {}, manual reassignments: {}", v["rules"].as_array().map_or(0, |a| a.len()), s(&v["attribution"]["manual"])); for w in v["warnings"].as_array().into_iter().flatten() { println!("  warning: {}", s(w)); } } }
+                HhCmd::Kids { member, months } => print_json(&match member { Some(m) => finch::household::kid_report(&ds, &con, &m, months)?, None => serde_json::json!(finch::household::children_overview(&ds, &con, months)?) }),
+                HhCmd::KidBudgets => print_json(&serde_json::json!(finch::household::kid_budget_status(&ds, None))),
+                HhCmd::WhoPays { months } => print_json(&finch::household::who_pays(&ds, months, None)),
+                HhCmd::Explain { tx } => print_json(&finch::household::explain(&con, &ds.people, &transfers::resolve_tx(&con, &tx)?)?),
+                HhCmd::Assign { tx, member, note } => print_json(&finch::household::assign(&con, &ds.people, &tx, &member, "cli", note.as_deref())?),
+                HhCmd::Clear { tx } => print_json(&finch::household::clear(&con, &tx, "cli")?),
+                HhCmd::Log { tx, limit } => for l in finch::household::log(&con, tx.as_deref(), limit)? { println!("  #{} {} {} {} -> {} ({})", s(&l["id"]), s(&l["at"]), s(&l["tx_key"]), l["old_member"].as_str().unwrap_or("-"), l["new_member"].as_str().unwrap_or("-"), s(&l["action"])); },
+                HhCmd::Undo { id } => print_json(&finch::household::revert(&con, &ds.people, id, "cli")?),
+            } }
         Cmd::Ui { host, port, dev, no_browser, login_link, user, rotate_session_key, static_dir } => {
             let (host, port) = (host.unwrap_or(cfg.ui_host.clone()), port.unwrap_or(cfg.ui_port as u16));
             if rotate_session_key { web::security::rotate_secret(&cfg.data_dir)?; println!("session key rotated: every browser session is signed out; run `finch ui` for a new login link"); return Ok(()); }

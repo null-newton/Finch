@@ -1,6 +1,7 @@
 //! `finch ui`: the local web app. Serves the built `web/` (static/) and its JSON API under /api/v1, with the Python app's
 //! security model (see `security`): one-time login link, signed cookie, CSRF, Host/Origin checks, rate limits, strict headers,
 //! and a CHILD login denied everything outside `CHILD_ALLOWED` (deny by default). Endpoints not ported yet answer 404 `not_ported`.
+pub mod memory_routes;
 pub mod routes;
 pub mod security;
 
@@ -16,7 +17,7 @@ pub const API: &str = "/api/v1";
 pub const DEV_PORTS: [u16; 2] = [5173, 4173];
 const PUBLIC: [(&str, &str); 2] = [("POST", "/api/v1/session/exchange"), ("GET", "/api/v1/session/methods")];
 /// What a CHILD login may call; everything else is 403 whether or not it exists. Add a path here only on purpose, with a test.
-pub const CHILD_ALLOWED: [(&str, &str); 7] = [("GET", "/api/v1/session"), ("POST", "/api/v1/session/logout"), ("GET", "/api/v1/meta/taxonomy"), ("GET", "/api/v1/me"),
+pub const CHILD_ALLOWED: [(&str, &str); 8] = [("PUT", "/api/v1/me/preferences"), ("GET", "/api/v1/session"), ("POST", "/api/v1/session/logout"), ("GET", "/api/v1/meta/taxonomy"), ("GET", "/api/v1/me"),
     ("GET", "/api/v1/me/summary"), ("GET", "/api/v1/me/transactions"), ("GET", "/api/v1/me/preferences")];
 const ASSET_EXT: [&str; 15] = ["js", "css", "png", "svg", "ico", "webmanifest", "json", "map", "txt", "woff", "woff2", "jpg", "jpeg", "webp", "xml"];
 
@@ -85,12 +86,12 @@ pub struct Snap { pub ds: Dataset, pub rec: Recurring }
 pub type HttpFactory = Arc<dyn Fn() -> Box<dyn Http> + Send + Sync>;
 
 pub struct App { pub cfg: Config, pub insecure: bool, pub sec: Security, pub static_dir: PathBuf, pub today: Option<NaiveDate>, pub http: HttpFactory,
-    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>> }
+    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, views: Mutex<HashMap<String, Arc<Snap>>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>> }
 impl App {
     pub fn new(cfg: Config, insecure: bool, port: u16, dev: bool, static_dir: PathBuf, http: HttpFactory) -> Result<Self> {
         let secret = security::load_secret(&cfg.data_dir, cfg.ui_key_rotation_days)?;
         let sec = Security::new(secret, port, if dev { &DEV_PORTS } else { &[] }, cfg.ui_session_hours, &cfg.data_dir);
-        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), inline_jobs: false, me: Default::default() })
+        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), views: Mutex::new(HashMap::new()), inline_jobs: false, me: Default::default() })
     }
     pub fn con(&self) -> Result<Connection> { db::connect(&self.cfg, db::Opts { insecure: self.insecure, ..Default::default() }) }
     /// Every write calls this: the next read recomputes the dataset.
@@ -107,6 +108,16 @@ impl App {
         let ds = Dataset::load(&self.con()?, &self.cfg, self.today)?; let rec = recurring::detect(&ds, &Scope::default(), true);
         let s = Arc::new(Snap { ds, rec }); *self.snap.lock().unwrap() = Some((key, s.clone())); Ok(s)
     }
+    /// The dataset of a request: a child login is always narrowed to its own member; otherwise `?member=` (a member id or 'joint') narrows it.
+    pub fn view(&self, r: &Req) -> Result<Arc<Snap>, ApiErr> {
+        let child = r.user.as_ref().filter(|u| u.is_child()).map(|u| u.member_id.clone().ok_or_else(|| ApiErr::new(403, "forbidden_scope", "this login belongs to no member"))).transpose()?;
+        let Some(m) = child.or_else(|| r.q("member").map(String::from)) else { return Ok(self.snap()?) };
+        let s = self.snap()?; if m != crate::household::JOINT && s.ds.people.get(&m).is_none() { return Err(ApiErr::new(404, "unknown_member", "no such household member")); }
+        let dk = self.data_key(); let key = format!("{dk}|{m}");
+        if let Some(v) = self.views.lock().unwrap().get(&key) { return Ok(v.clone()); }
+        let ds = s.ds.member_view(&m); let rec = recurring::detect(&ds, &Scope::default(), true); let v = Arc::new(Snap { ds, rec });
+        let mut vs = self.views.lock().unwrap(); vs.retain(|k, _| k.starts_with(&format!("{dk}|"))); vs.insert(key, v.clone()); Ok(v)
+    }
     pub fn today(&self) -> NaiveDate { self.today.unwrap_or_else(|| chrono::Local::now().date_naive()) }
     pub fn eb_configured(&self) -> bool { self.cfg.eb_app_id.is_some() && self.cfg.eb_private_key_path.is_some() && self.cfg.eb_redirect_url.is_some() }
 
@@ -116,7 +127,7 @@ impl App {
         let mut resp = match self.guard(&mut r, is_api) { Err(e) => e.resp(), Ok(()) => match if is_api { routes::route(self, &r) } else { self.static_file(&r) } { Ok(x) => x, Err(e) => e.resp() } };
         for (k, v) in security::HEADERS { resp.headers.push((k.into(), v.into())); }
         if is_api { resp.headers.push(("Cache-Control".into(), "no-store".into())); }
-        if is_api && r.sid.is_some() && matches!(r.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        if is_api && r.sid.is_some() && matches!(r.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") && !(r.qb("dry_run", false) && previews(&r.path)) {
             if let (Some(u), Ok(con)) = (&r.user, self.con()) { let _ = con.execute("INSERT INTO audit_log(at, actor, method, path, status) VALUES (?,?,?,?,?)", rusqlite::params![crate::util::now_iso(), u.id, r.method, r.path.chars().take(200).collect::<String>(), resp.status]); }
         }
         resp
@@ -145,7 +156,7 @@ impl App {
             if !self.sec.origin_allowed(r.h("origin")) { return Err(ApiErr::new(403, "forbidden", "origin not allowed")); }
             if !self.sec.csrf_valid(r.cookie.as_deref().unwrap_or(""), r.h(CSRF_HEADER)) { return Err(ApiErr::new(403, "csrf", "missing or wrong CSRF token (reload the page)")); }
             if bad_type { return Err(ApiErr::new(415, "unsupported_media_type", "send application/json")); }
-            if !self.sec.write.take(&sid) { return Err(ApiErr::new(429, "rate_limited", "too many changes in a short time: wait a moment")); }
+            if !(if r.qb("dry_run", false) && previews(&r.path) { &self.sec.preview } else { &self.sec.write }).take(&sid) { return Err(ApiErr::new(429, "rate_limited", "too many changes in a short time: wait a moment")); }
         }
         Ok(())
     }
@@ -170,6 +181,8 @@ impl App {
         }
     }
 }
+/// The endpoints whose `dry_run=true` really previews (a stray flag on another write gets no lax budget and no audit exemption).
+fn previews(path: &str) -> bool { ["/api/v1/budgets", "/api/v1/goals", "/api/v1/annotations", "/api/v1/transactions/category", "/api/v1/household/", "/api/v1/questions/"].iter().any(|p| path.starts_with(p)) }
 fn mime(ext: &str) -> &'static str {
     match ext { "js" => "text/javascript", "css" => "text/css", "png" => "image/png", "svg" => "image/svg+xml", "ico" => "image/x-icon", "webmanifest" => "application/manifest+json", "json" | "map" => "application/json",
         "woff2" => "font/woff2", "woff" => "font/woff", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp", "xml" => "application/xml", "txt" => "text/plain; charset=utf-8", "html" => "text/html; charset=utf-8", _ => "application/octet-stream" }

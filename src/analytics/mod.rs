@@ -66,7 +66,7 @@ pub fn in_list(cat: &str, names: &[String]) -> bool { names.iter().any(|n| cat =
 #[derive(Debug, Clone)]
 pub struct AccountInfo { pub uid: String, pub label: String, pub bank: Option<String>, pub owner: Option<String>, pub purpose: Option<String>, pub currency: Option<String> }
 #[derive(Debug, Clone)]
-pub struct Tx { pub key: String, pub date: NaiveDate, pub amount_c: i64, pub category: String, pub source: String, pub tags: BTreeSet<String>, pub event: Option<String>, pub entity: String, pub merchant: Option<String>, pub mkey: String, pub account: String, pub ty: Option<String>, pub desc: String, pub split_index: Option<usize>, pub split_of_c: Option<i64> }
+pub struct Tx { pub key: String, pub date: NaiveDate, pub amount_c: i64, pub category: String, pub source: String, pub tags: BTreeSet<String>, pub event: Option<String>, pub entity: String, pub merchant: Option<String>, pub mkey: String, pub account: String, pub ty: Option<String>, pub desc: String, pub split_index: Option<usize>, pub split_of_c: Option<i64>, /** the member it belongs to, 'joint', or None (household::Attributor) */ pub person: Option<String> }
 impl Tx {
     pub fn month(&self) -> String { month_key(self.date) }
     pub fn is_saved(&self) -> bool { SAVED_TAGS.iter().any(|t| self.tags.contains(*t)) }
@@ -86,6 +86,7 @@ impl Scope {
 #[derive(Debug, Clone)]
 pub struct AccountCoverage { pub account: String, pub label: String, pub bank: Option<String>, pub owner: Option<String>, pub purpose: Option<String>, pub first: Option<NaiveDate>, pub last: Option<NaiveDate>, pub last_booked: Option<NaiveDate>, pub last_sync: Option<NaiveDate>, pub n_tx: i64, pub months: Vec<String>, pub partial_months: Vec<String> }
 /// Which months each account has data for: covered = first <= month start, last >= month end, month closed before today.
+#[derive(Clone)]
 pub struct Coverage { pub today: NaiveDate, pub cov: BTreeMap<String, AccountCoverage> }
 fn ds(x: Option<NaiveDate>) -> Value { x.map_or(Value::Null, |d| d.to_string().into()) }
 impl Coverage {
@@ -124,19 +125,21 @@ pub fn last_n(m: &[String], n: usize) -> Vec<String> { if n > 0 && m.len() > n {
 #[derive(Debug, Clone)]
 pub struct Balance { pub account: String, pub amount_c: i64, pub ty: String, pub fetched_at: String, pub as_of: NaiveDate }
 pub const BALANCE_PREFERENCE: [&str; 8] = ["CLBD", "ITBD", "XPCD", "CLAV", "ITAV", "OPBD", "OPAV", "FWAV"];
+#[derive(Clone)]
 pub struct Dataset { pub today: NaiveDate, pub settings: Settings, pub accounts: BTreeMap<String, AccountInfo>, pub txs: Vec<Tx>, pub coverage: Coverage, pub foreign: Vec<String>, pub memory_warnings: Vec<String>,
     /// tx_key -> (creditor id, mandate ref) from the parsers
     pub parse_meta: HashMap<String, (Option<String>, Option<String>)>,
     /// stored recurring series id -> its tx keys (id continuity)
     pub stored_members: BTreeMap<String, BTreeSet<String>>,
     /// uid -> latest balance of the most "booked" type
-    pub balances: BTreeMap<String, Balance>, pub memory_dir: std::path::PathBuf }
+    pub balances: BTreeMap<String, Balance>, pub memory_dir: std::path::PathBuf,
+    pub people: crate::household::People, /** on a person's view: that member, and the accounts they OWN (the only balances of theirs) */ pub member: Option<String>, pub owned: Option<BTreeSet<String>> }
 
 impl Dataset {
     pub fn load(con: &Connection, cfg: &Config, today: Option<NaiveDate>) -> Result<Self> {
         let rules = Rules::load(cfg)?; let (ann, warn) = memory::load_annotations(&cfg.memory_dir);
         let mut ds = Self::load_with(con, &rules, &ann, today.unwrap_or_else(|| chrono::Local::now().date_naive()), Settings::from_table(&cfg.analytics)?, warn.into_iter().collect())?;
-        ds.memory_dir = cfg.memory_dir.clone(); Ok(ds)
+        ds.memory_dir = cfg.memory_dir.clone(); ds.people = crate::household::People::load(&cfg.memory_dir); ds.attribute(con)?; Ok(ds)
     }
     pub fn load_with(con: &Connection, rules: &Rules, ann: &[memory::Annotation], today: NaiveDate, settings: Settings, memory_warnings: Vec<String>) -> Result<Self> {
         let accounts: BTreeMap<String, AccountInfo> = con.prepare("SELECT uid, COALESCE(NULLIF(label,''), NULLIF(name,''), uid), bank, owner, purpose, currency FROM accounts WHERE exclude=0 AND needs_review=0 ORDER BY uid")?
@@ -147,7 +150,7 @@ impl Dataset {
             if !accounts.contains_key(&t.account) { continue; }
             if !matches!(t.currency.as_deref(), None | Some("") | Some("EUR")) { foreign.insert(t.tx_key); continue; }
             txs.push(Tx { entity: t.entity.clone().or(t.merchant.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| if t.key.is_empty() { t.tx_key.clone() } else { t.key.clone() }), key: t.tx_key, date, amount_c: to_cents(t.amount), category: t.category, source: t.source,
-                tags: t.tags.into_iter().collect(), event: t.event, merchant: t.merchant, mkey: t.key, account: t.account, ty: t.ty, desc: t.desc, split_index: t.split_index, split_of_c: t.split_of.map(to_cents) });
+                tags: t.tags.into_iter().collect(), event: t.event, merchant: t.merchant, mkey: t.key, account: t.account, ty: t.ty, desc: t.desc, split_index: t.split_index, split_of_c: t.split_of.map(to_cents), person: None });
         }
         txs.sort_by(|a, b| (a.date, &a.key, a.split_index.unwrap_or(0)).cmp(&(b.date, &b.key, b.split_index.unwrap_or(0))));
         let mut stats = HashMap::new();
@@ -169,7 +172,20 @@ impl Dataset {
             latest.entry(u).or_default().insert(t.unwrap_or_else(|| "?".into()), (f, to_cents(a)));
         }
         let balances = latest.into_iter().map(|(u, by)| { let t = BALANCE_PREFERENCE.iter().find(|t| by.contains_key(**t)).map(|t| t.to_string()).unwrap_or_else(|| by.keys().next().unwrap().clone()); let (f, c) = by[&t].clone(); (u.clone(), Balance { account: u, amount_c: c, ty: t, as_of: d(&f).unwrap(), fetched_at: f }) }).collect();
-        Ok(Self { today, settings, accounts, txs, coverage, foreign: foreign.into_iter().collect(), memory_warnings, parse_meta, stored_members, balances, memory_dir: std::path::PathBuf::new() })
+        Ok(Self { today, settings, accounts, txs, coverage, foreign: foreign.into_iter().collect(), memory_warnings, parse_meta, stored_members, balances, memory_dir: std::path::PathBuf::new(), people: Default::default(), member: None, owned: None })
+    }
+    /// Set the person of every transaction (manual line, attribution rule, account owner).
+    pub fn attribute(&mut self, con: &Connection) -> Result<()> {
+        let people = self.people.clone(); let at = crate::household::Attributor::new(con, &people)?;
+        for t in &mut self.txs { t.person = at.attribute(&t.key, &t.account, &t.desc, &t.mkey, t.amount_c as f64 / 100.0).person; } Ok(())
+    }
+    /// The same dataset seen as ONE member: only the transactions attributed to them (on any account); balances only of the accounts they own.
+    pub fn member_view(&self, member: &str) -> Self {
+        let owned: BTreeSet<String> = self.accounts.values().filter(|a| self.people.resolve(a.owner.as_deref()).as_deref() == Some(member)).map(|a| a.uid.clone()).collect();
+        let txs: Vec<Tx> = self.txs.iter().filter(|t| t.person.as_deref() == Some(member)).cloned().collect();
+        let keep: BTreeSet<String> = owned.iter().cloned().chain(txs.iter().map(|t| t.account.clone())).collect();
+        let mut v = self.clone(); v.accounts.retain(|u, _| keep.contains(u)); v.coverage.cov.retain(|u, _| keep.contains(u)); v.balances.retain(|u, _| owned.contains(u));
+        v.txs = txs; v.member = Some(member.into()); v.owned = Some(owned); v
     }
     pub fn accounts_in(&self, s: &Scope) -> Vec<&AccountInfo> { self.accounts.values().filter(|a| s.accepts(a)).collect() }
     pub fn uids_in(&self, s: &Scope) -> Vec<String> { self.accounts_in(s).into_iter().map(|a| a.uid.clone()).collect() }

@@ -21,7 +21,9 @@ financial life: treat every figure, name and merchant as private. **Numbers come
 - Code style: compact and dense, one-line comments above functions only when the name is not self-explanatory.
 - `cargo test` must pass. Tests use synthetic data only: never a real name, merchant line, amount, IBAN, key or home path.
 - Never write to the real database or `memory/`; use a scratch copy (`COACH_DB`, `COACH_MEMORY_DIR`, `COACH_DATA_DIR`, `COACH_CONFIG_DIR`).
-- Memory is read-only here: changes to the household memory are the Python app's proposals, accepted by the user themself.
+- Memory changes by a model are PROPOSALS only (`memory_propose`, `questions_propose`): never run `finch memory accept` or
+  `reject`, never edit memory files by hand, and never add a web or MCP path that accepts a proposal (accepting stays a terminal
+  action with a typed yes). Every write goes through `memstore::Store::edit` (validated, diffed, recorded in `.history.git`).
 - Every output of the MCP server goes through `mcp::Session::publish` (scan, wrap, cap, guard). Do not add a path around it,
   and add a leak assertion to `tests/e2e.rs` for any new tool.
 - A new network call must be justified, opt-in, and never send a name, merchant, account, IBAN or amount.

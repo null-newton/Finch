@@ -2,7 +2,7 @@
 //! under /api answers 404 `not_ported`. Reads come from the cached [`Snap`]; writes go through the existing functions and `touch()`.
 use super::{ApiErr, App, Job, Req, Resp, R};
 use crate::{analytics::{self, anomalies, averages::{category_averages, spending_txs}, cashflow::cashflow, planning, recurring, Dataset, Scope, Tx, is_income, is_transfer},
-    classify::{self, llm, rules::Rules}, ingest::{accounts, bank}, memory, transfers, util::*};
+    classify::{self, llm, rules::Rules}, household, ingest::{accounts, bank}, memory, transfers, util::*};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -23,21 +23,21 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["meta", "disclaimers"]) => ok(disclaimers(r.q("lang").unwrap_or("en"))),
         ("GET", ["meta", "filters"]) => filters(a),
         ("GET", ["health"]) => ok(health(a, &a.con()?)?),
-        ("GET", ["analytics", "coverage"]) => { let s = a.snap()?; ok(analytics::coverage(&s.ds)) }
-        ("GET", ["accounts", "balances"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(balances(&s.ds, &sc)) }
-        ("GET", ["analytics", "cashflow"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; let by = r.q("by");
+        ("GET", ["analytics", "coverage"]) => { let s = a.view(r)?; ok(analytics::coverage(&s.ds)) }
+        ("GET", ["accounts", "balances"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(balances(&s.ds, &sc)) }
+        ("GET", ["analytics", "cashflow"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; let by = r.q("by");
             let mut d = cashflow(&s.ds, &sc, r.qi("months", Some(6), 1, 36)?.unwrap() as usize, None, r.qb("include_current", true), by.is_some());
             if by.is_none() { d["by_purpose"] = json!({}); d["by_owner"] = json!({}); } ok(d) }
-        ("GET", ["analytics", "averages"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(category_averages(&s.ds, &sc, r.qi("window", None, 1, 36)?.map(|x| x as usize))) }
-        ("GET", ["analytics", "month-categories"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(month_categories(&s.ds, &sc, month_param(r)?)) }
-        ("GET", ["analytics", "forecast"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(planning::forecast(&s.ds, &s.rec, &sc, r.qi("days", Some(90), 7, 365)?.unwrap(), r.qb("points", true))) }
-        ("GET", ["categories"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(category_overview(&s.ds, &sc, &rules(a)?)) }
-        ("GET", ["categories", id]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(category_detail(&s.ds, &sc, &rules(a)?, id, r.qi("months", Some(24), 3, 60)?.unwrap())?) }
+        ("GET", ["analytics", "averages"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(category_averages(&s.ds, &sc, r.qi("window", None, 1, 36)?.map(|x| x as usize))) }
+        ("GET", ["analytics", "month-categories"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(month_categories(&s.ds, &sc, month_param(r)?)) }
+        ("GET", ["analytics", "forecast"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(planning::forecast(&s.ds, &s.rec, &sc, r.qi("days", Some(90), 7, 365)?.unwrap(), r.qb("points", true))) }
+        ("GET", ["categories"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(category_overview(&s.ds, &sc, &rules(a)?)) }
+        ("GET", ["categories", id]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(category_detail(&s.ds, &sc, &rules(a)?, id, r.qi("months", Some(24), 3, 60)?.unwrap())?) }
         ("GET", ["calendar"]) => calendar(a, r),
-        ("GET", ["calendar.ics"]) => { let s = a.snap()?; let c = planning::calendar(&s.ds, &a.con()?, &s.rec, Some(r.qi("days", Some(90), 1, 400)?.unwrap() as usize), false);
+        ("GET", ["calendar.ics"]) => { let s = a.view(r)?; let c = planning::calendar(&s.ds, &a.con()?, &s.rec, Some(r.qi("days", Some(90), 1, 400)?.unwrap() as usize), false);
             Ok(Resp::with(200, ics(&c).into_bytes(), "text/calendar; charset=utf-8").header("Content-Disposition", "attachment; filename=\"finance-coach.ics\"")) }
-        ("GET", ["budgets"]) => budgets(a),
-        ("GET", ["budgets", "suggestions"]) => { let s = a.snap()?; let sc = scope(r, &s.ds)?; ok(planning::suggest(&s.ds, &sc, r.qi("months", None, 2, 24)?.map(|x| x as usize), r.qi("limit", Some(20), 1, 100)?.map(|x| x as usize))) }
+        ("GET", ["budgets"]) => budgets(a, r),
+        ("GET", ["budgets", "suggestions"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(planning::suggest(&s.ds, &sc, r.qi("months", None, 2, 24)?.map(|x| x as usize), r.qi("limit", Some(20), 1, 100)?.map(|x| x as usize))) }
         ("GET", ["goals"]) => { let s = a.snap()?; ok(planning::goals(&s.ds)) }
         ("GET", ["subscriptions"]) => subscriptions(a, r),
         ("GET", ["insights"]) => insights(a, r),
@@ -62,13 +62,30 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["review"]) => review(a, r),
         ("POST", ["review", "correct"]) => { let b = r.json()?; let (k, c) = (b["key"].as_str().unwrap_or(""), b["category"].as_str().unwrap_or("")); llm::correct(&a.con()?, &rules(a)?, k, c, None).map_err(ApiErr::rejected)?; a.touch(); ok(json!({"key": k, "category": c, "merchants": [k]})) }
         ("POST", ["review", "confirm"]) => review_confirm(a, r),
+        ("GET", ["household", "overview"]) => { let s = a.snap()?; ok(household::overview(&s.ds, &a.con()?)?) }
+        ("GET", ["household", "kids"]) => { let s = a.snap()?; ok(json!({"as_of": s.ds.today.to_string(), "children": household::children_overview(&s.ds, &a.con()?, r.qi("months", Some(6), 1, 24)?.unwrap() as usize)?})) }
+        ("GET", ["household", "kids", m]) => { let s = a.snap()?; if s.ds.people.get(m).is_none() { return Err(ApiErr::new(404, "unknown_member", "no such household member")); } ok(household::kid_report(&s.ds, &a.con()?, m, r.qi("months", Some(6), 1, 24)?.unwrap() as usize)?) }
+        ("GET", ["household", "kid-budgets"]) => { let s = a.snap()?; ok(json!({"as_of": s.ds.today.to_string(), "budgets": household::kid_budget_status(&s.ds, None)})) }
+        ("GET", ["household", "allocation"]) => { let s = a.snap()?; ok(household::who_pays(&s.ds, r.qi("months", Some(12), 1, 36)?.unwrap() as usize, r.q("rule"))) }
+        ("GET", ["household", "attribution", "log"]) => ok(json!({"entries": household::log(&a.con()?, r.q("tx_key"), r.qi("limit", Some(50), 1, 500)?.unwrap())?})),
+        ("POST", ["household", "attribution", "log", id, "undo"]) => { let id: i64 = id.parse().map_err(|_| ApiErr::not_found("no such log line"))?; let v = household::revert(&a.con()?, &a.snap()?.ds.people, id, &actor(r)).map_err(ApiErr::rejected)?; a.touch(); ok(v) }
+        ("GET", ["transactions", "attribution"]) => { let k = r.q("tx_key").ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: tx_key: field required"))?; ok(household::explain(&a.con()?, &a.snap()?.ds.people, k).map_err(|e| ApiErr::not_found(&e.to_string()))?) }
+        ("POST", ["transactions", "person"]) => { let b = r.json()?; let v = household::assign(&a.con()?, &a.snap()?.ds.people, b["tx_key"].as_str().unwrap_or(""), b["member"].as_str().unwrap_or(""), &actor(r), b["note"].as_str()).map_err(ApiErr::rejected)?; a.touch(); ok(v) }
+        ("POST", ["transactions", "person", "clear"]) => { let v = household::clear(&a.con()?, &body_str(r, "tx_key")?, &actor(r)).map_err(ApiErr::rejected)?; a.touch(); ok(v) }
+        ("GET", ["household", "users"]) => ok(json!({"users": household::overview(&a.snap()?.ds, &a.con()?)?["users"], "manage": "logins are managed in a terminal (ui_users)"})),
+        ("GET", ["household", "audit"]) => { let lim = r.qi("limit", Some(100), 1, 500)?.unwrap(); let con = a.con()?;
+            let rows: Vec<Value> = con.prepare("SELECT at, actor, method, path, status FROM audit_log WHERE (?1 IS NULL OR actor=?1) ORDER BY id DESC LIMIT ?2")?.query_map(params![r.q("actor"), lim], |x| Ok(json!({"at": x.get::<_, String>(0)?, "actor": x.get::<_, String>(1)?, "method": x.get::<_, String>(2)?, "path": x.get::<_, String>(3)?, "status": x.get::<_, i64>(4)?})))?.collect::<rusqlite::Result<_>>()?;
+            ok(json!({"requests": rows, "memory": []})) }
+        ("GET", ["me"]) => { let u = r.user.clone().unwrap_or_else(super::User::owner); let s = a.snap()?; let m = u.member_id.as_deref().and_then(|m| s.ds.people.get(m)); ok(json!({"user": u.to_json(), "member": m.map(|m| json!({"id": m.id, "name": m.name, "role": m.role}))})) }
+        ("GET", ["me", "summary"]) => me_summary(a, r),
+        ("GET", ["me", "transactions"]) => me_transactions(a, r),
+        ("GET", ["me", "preferences"]) => { let u = r.user.clone().unwrap_or_else(super::User::owner); ok(json!({"prefs": u.prefs, "allowed": {"locale": ["fr-FR", "en-GB", "it-IT"], "theme": ["system", "light", "dark"], "default_member": null, "landing": ["dashboard", "transactions", "kids"]}, "stored": u.id != "owner"})) }
+        ("PUT", ["me", "preferences"]) => put_prefs(a, r),
         ("GET", ["review", "ai"]) => ok(json!({"available": false, "web_search": false, "backend": a.cfg.llm_backend, "message": NOT_PORTED})),
         // the shell asks for these on every page: empty answers until their features are ported
         ("GET", ["alerts", "summary"]) => ok(json!({"ready": false, "open": 0, "new": 0, "high": 0})),
-        ("GET", ["questions"]) => ok(json!({"questions": [], "counts": {}})),
-        ("GET", ["proposals"]) => ok(json!({"proposals": []})),
         ("GET", ["coach", "status"]) => ok(json!({"configured": false, "backend": a.cfg.coach_backend, "model": "", "message": NOT_PORTED, "max_tool_calls": 0, "timeout_seconds": 0, "busy": false, "current_job": null, "tools": []})),
-        _ => Err(ApiErr::new(404, "not_ported", NOT_PORTED)),
+        _ => super::memory_routes::route(a, r, &seg).unwrap_or_else(|| Err(ApiErr::new(404, "not_ported", NOT_PORTED))),
     }
 }
 fn ok(v: Value) -> R { Ok(Resp::json(v)) }
@@ -79,9 +96,8 @@ fn month_param(r: &Req) -> Result<Option<String>, ApiErr> {
 }
 fn rx_month() -> regex::Regex { regex::Regex::new(r"^\d{4}-(0[1-9]|1[0-2])$").unwrap() }
 
-/// The analytics scope of a request (owner / purpose / account). A per-person view (`member`) needs the household attribution.
+/// The analytics scope of a request (owner / purpose / account); `member` is handled by `App::view`.
 fn scope(r: &Req, ds: &Dataset) -> Result<Scope, ApiErr> {
-    if r.q("member").is_some() { return Err(ApiErr::new(409, "not_ported", "per-person views need the household attribution, which is not ported to finch yet: switch back to the household")); }
     let one = |x: Option<&str>| x.map(|v| [v.to_string()].into());
     let accounts = r.q("account").map(|x| [ds.accounts.values().find(|a| a.uid == x || a.label.eq_ignore_ascii_case(x)).map_or(x.to_string(), |a| a.uid.clone())].into());
     Ok(Scope { owners: one(r.q("owner")), purposes: one(r.q("purpose")), accounts })
@@ -254,7 +270,7 @@ fn review_confirm(a: &App, r: &Req) -> R {
 // ---------------------------------------------------------------- balances / categories
 fn balances(ds: &Dataset, sc: &Scope) -> Value {
     let stale = ds.settings.forecast_balance_stale_days as i64; let mut total = 0;
-    let mut rows: Vec<Value> = ds.accounts_in(sc).into_iter().map(|a| { let b = ds.balances.get(&a.uid); if let Some(b) = b { total += b.amount_c; }
+    let mut rows: Vec<Value> = ds.accounts_in(sc).into_iter().filter(|a| ds.owned.as_ref().is_none_or(|o| o.contains(&a.uid))).map(|a| { let b = ds.balances.get(&a.uid); if let Some(b) = b { total += b.amount_c; }
         json!({"uid": a.uid, "label": a.label, "bank": a.bank, "owner": a.owner, "purpose": a.purpose, "balance": b.map(|b| money_str(b.amount_c)), "balance_type": b.map(|b| b.ty.clone()),
             "balance_type_label": b.map(|b| BALANCE_TYPE.iter().find(|x| x.0 == b.ty).map_or(b.ty.clone(), |x| x.1.to_string())), "booked": b.is_some_and(|b| b.ty == "CLBD" || b.ty == "ITBD"),
             "as_of": b.map(|b| b.as_of.to_string()), "age_days": b.map(|b| (ds.today - b.as_of).num_days()), "stale": b.is_some_and(|b| (ds.today - b.as_of).num_days() > stale)}) }).collect();
@@ -341,7 +357,7 @@ fn category_detail(ds: &Dataset, sc: &Scope, rules: &Rules, id: &str, months: i6
 
 // ---------------------------------------------------------------- calendar / budgets / subscriptions / insights
 fn calendar(a: &App, r: &Req) -> R {
-    let s = a.snap()?; let con = a.con()?;
+    let s = a.view(r)?; let con = a.con()?;
     if let Some(m) = month_param(r)? {
         let n = ((month_end(&m) - s.ds.today).num_days() + 1).clamp(1, 400) as usize; let mut d = planning::calendar(&s.ds, &con, &s.rec, Some(n), false);
         let items: Vec<Value> = d["items"].as_array().cloned().unwrap_or_default().into_iter().filter(|i| i["date"].as_str().is_some_and(|x| x.starts_with(&m))).collect();
@@ -359,13 +375,13 @@ fn ics(c: &Value) -> String {
     }
     out + "END:VCALENDAR\r\n"
 }
-fn budgets(a: &App) -> R {
-    let s = a.snap()?; let mut d = planning::status(&s.ds, &s.rec, None); let (list, problems) = planning::budgets(&s.ds);
+fn budgets(a: &App, r: &Req) -> R {
+    let s = a.view(r)?; let mut d = planning::status(&s.ds, &s.rec, None); let (list, problems) = planning::budgets(&s.ds);
     for row in d["budgets"].as_array_mut().into_iter().flatten() { if let Some(b) = list.iter().find(|b| row["id"] == b.id.as_str()) { row["category"] = json!(b.category); row["group"] = json!(b.group); row["note"] = json!(b.note); row["start"] = json!(b.start); } }
     d["problems"] = json!(problems); ok(d)
 }
 fn subscriptions(a: &App, r: &Req) -> R {
-    let s = a.snap()?; let sc = scope(r, &s.ds)?; let (status, kind, cadence, contracts_only) = (r.q("status").unwrap_or("active"), r.q("kind").unwrap_or("expense"), r.q("cadence"), r.qb("contracts_only", false));
+    let s = a.view(r)?; let sc = scope(r, &s.ds)?; let (status, kind, cadence, contracts_only) = (r.q("status").unwrap_or("active"), r.q("kind").unwrap_or("expense"), r.q("cadence"), r.qb("contracts_only", false));
     let pcs = recurring::price_changes(&s.ds, &s.rec, None, false, &HashSet::new(), false);
     let rows: Vec<Value> = s.rec.json["series"].as_array().into_iter().flatten().filter(|x| (kind == "all" || x["kind"] == kind) && (status == "all" || x["status"] == status) && cadence.is_none_or(|c| x["cadence"] == c)
         && (!contracts_only || x["contract_candidate"] == true || x["links"].as_array().is_some_and(|l| !l.is_empty())) && (sc.is_all() || s.ds.accounts.get(x["account"].as_str().unwrap_or("")).is_some_and(|ac| sc.accepts(ac))))
@@ -377,7 +393,7 @@ fn subscriptions(a: &App, r: &Req) -> R {
 }
 fn iid(parts: &[&str]) -> String { format!("ins_{}", &sha1_hex(&parts.join("|"))[..10]) }
 fn insights(a: &App, r: &Req) -> R {
-    let s = a.snap()?; let sc = scope(r, &s.ds)?; let con = a.con()?; let ds = &s.ds;
+    let s = a.view(r)?; let sc = scope(r, &s.ds)?; let con = a.con()?; let ds = &s.ds;
     let an = anomalies::detect(ds, &sc, &s.rec, &anomalies::dismissed_ids(&con)?, false);
     let dis: HashSet<String> = con.prepare("SELECT id FROM price_change_dismissals")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>().map_err(anyhow::Error::from)?;
     let pcs = recurring::price_changes(ds, &s.rec, None, false, &dis, false); let fc = planning::forecast(ds, &s.rec, &sc, 90, false); let bs = planning::status(ds, &s.rec, None);
@@ -447,17 +463,17 @@ fn select(ds: &Dataset, r: &Req) -> Result<Vec<Tx>, ApiErr> {
 fn item(ds: &Dataset, t: &Tx, f: &Flags) -> Value {
     let acc = ds.accounts.get(&t.account);
     json!({"tx_key": t.key, "date": t.date.to_string(), "amount": money_str(t.amount_c), "category": t.category, "source": t.source, "tags": t.tags, "event": t.event, "entity": t.entity, "merchant": t.merchant, "description": t.desc, "account": t.account,
-        "account_label": acc.map_or(t.account.clone(), |a| a.label.clone()), "owner": acc.and_then(|a| a.owner.clone()), "purpose": acc.and_then(|a| a.purpose.clone()), "type": t.ty, "person": null,
+        "account_label": acc.map_or(t.account.clone(), |a| a.label.clone()), "owner": acc.and_then(|a| a.owner.clone()), "purpose": acc.and_then(|a| a.purpose.clone()), "type": t.ty, "person": t.person,
         "split": f.split.contains(&t.key) || t.source == "split", "overridden": f.over.contains(&t.key), "transfer_linked": f.linked.contains(&t.key)})
 }
 fn tx_list(a: &App, r: &Req) -> R {
-    let s = a.snap()?; let (limit, offset) = (r.qi("limit", Some(50), 1, 500)?.unwrap() as usize, r.qi("offset", Some(0), 0, i64::MAX)?.unwrap() as usize);
+    let s = a.view(r)?; let (limit, offset) = (r.qi("limit", Some(50), 1, 500)?.unwrap() as usize, r.qi("offset", Some(0), 0, i64::MAX)?.unwrap() as usize);
     let rows = select(&s.ds, r)?; let f = flags(&a.con()?)?; let (inc, out): (i64, i64) = (rows.iter().filter(|t| t.amount_c > 0).map(|t| t.amount_c).sum(), rows.iter().filter(|t| t.amount_c < 0).map(|t| t.amount_c).sum());
     ok(json!({"items": rows.iter().skip(offset).take(limit).map(|t| item(&s.ds, t, &f)).collect::<Vec<_>>(), "totals": {"count": rows.len(), "sum": money_str(inc + out), "income": money_str(inc), "outflow": money_str(out)},
         "limit": limit, "offset": offset, "total": rows.len(), "next_offset": if offset + limit < rows.len() { json!(offset + limit) } else { Value::Null }}))
 }
 fn tx_csv(a: &App, r: &Req) -> R {
-    let s = a.snap()?; let rows = select(&s.ds, r)?; let f = flags(&a.con()?)?; let eu = matches!(r.q("locale"), Some("fr-FR") | Some("it-IT") | Some("nl-BE"));
+    let s = a.view(r)?; let rows = select(&s.ds, r)?; let f = flags(&a.con()?)?; let eu = matches!(r.q("locale"), Some("fr-FR") | Some("it-IT") | Some("nl-BE"));
     let cell = |v: &Value| { let s = match v { Value::Null => String::new(), Value::String(s) => s.clone(), x => x.to_string() }; if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s } };
     let mut w = csv::WriterBuilder::new().delimiter(if eu { b';' } else { b',' }).from_writer(if eu { "\u{feff}".as_bytes().to_vec() } else { vec![] });
     w.write_record(["date", "account", "owner", "purpose", "amount_eur", "category", "source", "merchant", "description", "tags", "event"]).map_err(anyhow::Error::from)?;
@@ -484,8 +500,11 @@ fn tx_detail(a: &App, r: &Req) -> R {
 fn tx_category(a: &App, r: &Req) -> R {
     let b = r.json()?; let (k, cat, sc) = (b["tx_key"].as_str().unwrap_or(""), b["category"].as_str().unwrap_or(""), b["scope"].as_str().unwrap_or("")); let rules = rules(a)?;
     if !rules.categories.contains_key(cat) { return Err(ApiErr::new(422, "unknown_category", &format!("unknown category {cat:?}"))); }
-    if r.qb("dry_run", false) || sc == "memory" { return Err(ApiErr::new(409, "not_ported", "previews and memory annotations are not ported to finch yet: fix this transaction or this merchant")); }
     let con = a.con()?; if con.query_row("SELECT 1 FROM transactions WHERE tx_key=?", [k], |_| Ok(())).optional().map_err(anyhow::Error::from)?.is_none() { return Err(ApiErr::not_found("no such transaction")); }
+    let mkey: Option<String> = con.query_row("SELECT merchant_key FROM tx_enriched WHERE tx_key=?", [k], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().filter(|m| !m.is_empty());
+    if sc == "memory" { let by_tx = b["match"].as_str() == Some("transaction") || mkey.is_none(); let mut body = json!({"category": cat, "tags": b["tags"], "event": b["event"], "note": b["note"], "reason": b["note"].as_str().map(String::from).unwrap_or(format!("category fixed in the web app: {cat}"))});
+        if by_tx { body["tx_keys"] = json!([k]); } else { body["merchant_key"] = json!(mkey); } let mut resp = super::memory_routes::annotate(a, r, &body)?; let mut v: Value = serde_json::from_slice(&resp.body).unwrap_or_default(); v["scope"] = sc.into(); v["category"] = cat.into(); resp.body = v.to_string().into_bytes(); return Ok(resp); }
+    if r.qb("dry_run", false) { let n = if sc == "merchant" { let s = a.snap()?; mkey.as_ref().map_or(0, |m| s.ds.whole().iter().filter(|t| &t.mkey == m).count()) } else { 1 }; return ok(json!({"dry_run": true, "scope": sc, "category": cat, "changed": n > 0, "affected": {"count": n, "blocked": [], "merchant_key": mkey}, "diff": "", "warnings": []})); }
     let (count, mkey) = match sc {
         "transaction" => { con.execute("INSERT INTO tx_overrides(tx_key, category, note) VALUES (?,?,?) ON CONFLICT(tx_key) DO UPDATE SET category=excluded.category, note=excluded.note", params![k, cat, b["note"].as_str()]).map_err(anyhow::Error::from)?; (1, None) }
         "merchant" => { let m: String = con.query_row("SELECT merchant_key FROM tx_enriched WHERE tx_key=?", [k], |r| r.get::<_, Option<String>>(0)).optional().map_err(anyhow::Error::from)?.flatten().filter(|m| !m.is_empty()).ok_or_else(|| ApiErr::rejected("this transaction has no merchant key: fix this transaction only"))?;
@@ -500,4 +519,39 @@ fn transfers_list(a: &App) -> R {
     let leg = |l: &transfers::Leg| json!({"tx_key": l.tx_key, "date": l.date, "amount": money_str(to_cents(l.amount)), "account": l.account, "description": l.description});
     let links: Vec<Value> = transfers::list_links(&con)?.into_iter().map(|mut l| { l["amount"] = money_str(to_cents(l["amount"].as_f64().unwrap_or(0.0))).into(); l }).collect();
     ok(json!({"links": links, "proposals": res.linked.iter().chain(&res.proposals).map(|p| json!({"debit": leg(&p.debit), "credit": leg(&p.credit), "confidence": p.confidence, "days": p.days, "topup": p.topup, "strong": p.strong, "scope": if p.household { "household" } else { "own" }, "to_child": p.to_child})).collect::<Vec<_>>(), "ambiguous": res.ambiguous.len()}))
+}
+
+// ---------------------------------------------------------------- the logged-in person (/me): derived from the LOGIN, never from a parameter
+fn actor(r: &Req) -> String { r.user.as_ref().map_or("ui".into(), |u| if u.id == "owner" { "ui".into() } else { format!("ui:{}", u.id) }) }
+fn my_member(a: &App, r: &Req) -> Result<(std::sync::Arc<super::Snap>, String), ApiErr> {
+    let s = a.snap()?; let m = r.user.as_ref().and_then(|u| u.member_id.clone()).filter(|m| s.ds.people.get(m).is_some()).ok_or_else(|| ApiErr::new(404, "no_member", "this login is not linked to a household member"))?; Ok((s, m))
+}
+/// What a child is told about where money came from: never a name.
+fn kind_of_source(p: &household::People, src: &str) -> &'static str { if src == household::JOINT || p.role(src) == Some("adult") { "a parent" } else if p.role(src) == Some("child") { "family" } else { "someone else" } }
+fn me_summary(a: &App, r: &Req) -> R {
+    let (s, m) = my_member(a, r)?; let p = &s.ds.people; let mut rep = household::kid_report(&s.ds, &a.con()?, &m, 6)?;
+    for it in rep["extra_topups"]["items"].as_array_mut().into_iter().flatten() { let k = kind_of_source(p, it["source"].as_str().unwrap_or("")); it["source"] = k.into(); it.as_object_mut().unwrap().remove("tx_key"); }
+    for x in rep["pocket_money"]["series"].as_array_mut().into_iter().flatten() { let k = kind_of_source(p, x["source"].as_str().unwrap_or("")); x["source"] = k.into(); let o = x.as_object_mut().unwrap(); o.remove("evidence"); o.remove("id"); }
+    let mut by: BTreeMap<&str, i64> = BTreeMap::new(); for (src, v) in rep["extra_topups"]["by_source"].as_object().cloned().unwrap_or_default() { *by.entry(kind_of_source(p, &src)).or_default() += cents_of(&v); }
+    rep["extra_topups"]["by_source"] = json!(by.into_iter().map(|(k, v)| (k.to_string(), json!(money_str(v)))).collect::<Map<_, _>>()); rep.as_object_mut().unwrap().remove("accounts");
+    let budgets: Vec<Value> = household::kid_budget_status(&s.ds, Some(&m)).into_iter().map(|mut b| { b.as_object_mut().unwrap().remove("member"); b }).collect();
+    ok(json!({"member": m, "name": p.get(&m).map(|x| x.name.clone()), "report": rep, "budgets": budgets}))
+}
+fn me_transactions(a: &App, r: &Req) -> R {
+    let (s, m) = my_member(a, r)?; let p = &s.ds.people; let (limit, offset) = (r.qi("limit", Some(30), 1, 200)?.unwrap() as usize, r.qi("offset", Some(0), 0, i64::MAX)?.unwrap() as usize);
+    let mut rows: Vec<Tx> = s.ds.whole().into_iter().filter(|t| t.person.as_deref() == Some(m.as_str())).collect(); rows.sort_by(|x, y| (y.date, &y.key).cmp(&(x.date, &x.key)));
+    let who = |t: &Tx| -> String { let named: Vec<String> = p.mentioned(&format!("{} {} {}", t.entity, t.merchant.as_deref().unwrap_or(""), t.desc)).into_iter().filter(|x| *x != m).collect();
+        if let Some(n) = named.first() { return kind_of_source(p, n).into(); }
+        if t.category.starts_with("transfer.") || t.ty.as_deref().is_some_and(|x| ["person_transfer_in", "person_transfer_out", "internal_transfer", "wero_in", "wero_out"].contains(&x)) { return if t.category.contains("people") { "someone else" } else { "a transfer" }.into(); }
+        t.entity.clone() };
+    ok(json!({"total": rows.len(), "limit": limit, "offset": offset, "items": rows.iter().skip(offset).take(limit).map(|t| json!({"date": t.date.to_string(), "amount": money_str(t.amount_c), "category": t.category, "merchant": who(t)})).collect::<Vec<_>>()}))
+}
+fn put_prefs(a: &App, r: &Req) -> R {
+    let u = r.user.clone().unwrap_or_else(super::User::owner); if u.id == "owner" { return Err(ApiErr::new(409, "no_stored_login", "the owner login has no stored preferences: create a per-person login (ui_users)")); }
+    let b = r.json()?; let prefs = b["prefs"].as_object().ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: prefs: an object"))?; let s = a.snap()?;
+    let mut merged = u.prefs.as_object().cloned().unwrap_or_default();
+    for (k, v) in prefs { let v = v.as_str().unwrap_or("").to_string(); let ok = match k.as_str() { "locale" => ["fr-FR", "en-GB", "it-IT"].contains(&v.as_str()), "theme" => ["system", "light", "dark"].contains(&v.as_str()), "landing" => ["dashboard", "transactions", "kids"].contains(&v.as_str()),
+            "default_member" => !u.is_child() && (v.is_empty() || v == household::JOINT || s.ds.people.get(&v).is_some()), _ => false };
+        if !ok { return Err(ApiErr::rejected(format!("preference {k}: {v:?} is not allowed"))); } merged.insert(k.clone(), v.into()); }
+    a.con()?.execute("UPDATE ui_users SET prefs=? WHERE id=?", params![Value::Object(merged.clone()).to_string(), u.id])?; ok(json!({"prefs": merged}))
 }

@@ -92,7 +92,8 @@ fn endpoints() {
     let mc = c.get("/api/v1/analytics/month-categories?month=2025-04"); assert_eq!(mc["month"], "2025-04"); assert!(mc["categories"].as_array().unwrap().iter().any(|x| x["category"] == "food.groceries" && x["spent"] == "120.50"));
     assert_eq!(c.call("GET", "/api/v1/analytics/month-categories?month=2025-13", None).0, 422);
     assert_eq!(c.call("GET", "/api/v1/analytics/cashflow?months=99", None).0, 422);
-    assert_eq!(c.call("GET", "/api/v1/analytics/cashflow?member=zorro", None).0, 409, "per-person views are not ported");
+    assert_eq!(c.call("GET", "/api/v1/analytics/cashflow?member=zorro", None).0, 200, "a person's view");
+    assert_eq!(c.call("GET", "/api/v1/analytics/cashflow?member=ghost", None).0, 404, "an unknown member");
     assert!(c.get("/api/v1/analytics/forecast?days=30")["household"].is_object());
     assert!(c.get("/api/v1/calendar?days=40")["items"].is_array());
     let ics = c.raw("GET", "/api/v1/calendar.ics", None, &[]); assert!(String::from_utf8_lossy(&ics.body).starts_with("BEGIN:VCALENDAR"));

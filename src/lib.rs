@@ -12,4 +12,8 @@ pub mod secrets;
 pub mod transfers;
 pub mod mcp;
 pub mod privacy;
+pub mod household;
+pub mod memstore;
+pub mod proposals;
+pub mod questions;
 pub mod web;

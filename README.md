@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 4)
+## Status (phase 5b)
 
 | Area | State |
 |---|---|
@@ -29,11 +29,15 @@ Python app, so both can work on the same data while the port is in progress.
 | MCP server `finance` (stdio): `coverage`, `cashflow`, `category_averages`, `transactions_search`, `recurring`, `price_changes`, `anomalies`, `forecast`, `budget_status`, `budget_suggestions`, `calendar`, `goals` | ported |
 | Web API `finch ui` (loopback only): one-time login link (token in the URL fragment), signed HttpOnly SameSite=Strict cookie, CSRF, Host / Origin / `Sec-Fetch-Site` checks, rate limits, strict headers (CSP), revocable sessions, per-person logins with a deny-by-default child scope, audit log; serves `static/` | ported (phase 4) |
 | Web endpoints: session, taxonomy, filters, health, balances, cash flow, averages, month categories, forecast, categories (drill-down), calendar (+ `.ics`), budgets, goals, subscriptions, insights (dismiss), transactions (filters, totals, CSV export, detail, category fix, override), transfers (link / unlink), connections, account edit, sync and connect jobs, banks, review queue | ported (phase 4); the rest answers 404 `not_ported` |
+| Household & people: members, attribution (manual reassignment > rule incl. Belgian card digits > account owner), logged and reversible; per-person views (`?member=` in the web app, `member` on the MCP tools); the children's money (pocket money vs extra top-ups with their source, balance trend), kid budgets, who pays what; a child login's own `/me` pages | ported (phase 5a); `finch household ...`; editing household.yaml stays a memory proposal |
+| MCP `household_overview`, `kids_money`, `who_pays` (pseudonyms and roles only) | ported (phase 5a) |
+| Memory store: validated edits (schema, categories, member references), comment-preserving YAML patches (only the touched item is re-rendered), unified diffs, the same git history (`.history.git`) and messages as the Python app; web edits of budgets, goals, annotations, attribution rules, kid budgets, pocket money and allocations with `dry_run` previews | ported (phase 5b) for budgets, goals, categorization, household, events, open questions and the Markdown notes; other memory files stay with the Python app |
+| Open questions (yaml + the generated Markdown view, byte for byte), sealed proposals in the Python app's format (seal, registry, history verdict); `finch memory proposals / show / accept / reject / history / diff / check`, `finch questions ...`; MCP `open_questions`, `memory_propose`, `questions_propose` (custom questions) | ported (phase 5b); accepting is a terminal action with a typed yes |
 | Web app (`web/`) | restyled with the toolbox look (Manrope / DM Mono, ink-teal and lime, drafting grid); pages and interactions unchanged; the bank connection asks you to paste the redirect address |
 
-Not ported yet (phase 5): per-person views (`?member=`), previews (`dry_run`) and memory annotations in the web app; memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth,
-rental property, alerts, household attribution, year review, quality / eval, backups and export. Until then, use the Python app for
-them on the same database. Budgets and goals are read from `memory/`; writing them stays a memory proposal.
+Not ported yet (phase 5c and later): question generation from the data, document extraction, memory revert, the coach runtime, subscriptions and contracts, loans and net worth,
+rental property, alerts, year review, quality / eval, backups and export. Until then, use the Python app for
+them on the same database. The web app edits memory for the person at the keyboard; a model only ever proposes.
 
 ## Belgian banks
 
