@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 5b)
+## Status (phase 5c)
 
 | Area | State |
 |---|---|
@@ -33,10 +33,13 @@ Python app, so both can work on the same data while the port is in progress.
 | MCP `household_overview`, `kids_money`, `who_pays` (pseudonyms and roles only) | ported (phase 5a) |
 | Memory store: validated edits (schema, categories, member references), comment-preserving YAML patches (only the touched item is re-rendered), unified diffs, the same git history (`.history.git`) and messages as the Python app; web edits of budgets, goals, annotations, attribution rules, kid budgets, pocket money and allocations with `dry_run` previews | ported (phase 5b) for budgets, goals, categorization, household, events, open questions and the Markdown notes; other memory files stay with the Python app |
 | Open questions (yaml + the generated Markdown view, byte for byte), sealed proposals in the Python app's format (seal, registry, history verdict); `finch memory proposals / show / accept / reject / history / diff / check`, `finch questions ...`; MCP `open_questions`, `memory_propose`, `questions_propose` (custom questions) | ported (phase 5b); accepting is a terminal action with a typed yes |
+| Loans and net worth: amortization schedules (Belgian EQUIVALENT monthly rate by default, `rate.monthly_convention: proportional` for i / 12), deferrals, borrower insurance, the future table from a dated outstanding capital, payment and capital checks, the legal maximum early-repayment indemnity (mortgage: 3 months of interest; fixed-rate consumer credit: 1 % / 0.5 %), net worth with unknown items listed, never zero | ported (phase 5c, Belgian rules); lease end-of-contract views, loan inference, scenarios and net-worth history are not |
+| Subscriptions and contracts: inventory of recurring costs with their `contracts/*.yaml`, price history, usage as stated, and Belgian cancellation rules (telecom 6 months, energy 1 month, insurance 3 months before the due date, tacitly renewed services 2 months) with their legal basis | ported (phase 5c, Belgian rules); alternatives, decisions, letters and contract drafts are not |
+| Rental property: linked account and loan, months of rent / costs / net / effort, missing rents, yearly totals, Belgian rent indexation from the owner's own health-index figures (`lease:` on the asset); tax: private letting is taxed on the cadastral income | ported (phase 5c, Belgian rules); no French scheme (Pinel) |
+| MCP `net_worth`, `loans_overview`, `rental_overview`, `subscriptions_inventory`, `cancellability` (kinds and refs only: never a lender, description or contract number) | ported (phase 5c) |
 | Web app (`web/`) | restyled with the toolbox look (Manrope / DM Mono, ink-teal and lime, drafting grid); pages and interactions unchanged; the bank connection asks you to paste the redirect address |
 
-Not ported yet (phase 5c and later): question generation from the data, document extraction, memory revert, the coach runtime, subscriptions and contracts, loans and net worth,
-rental property, alerts, year review, quality / eval, backups and export. Until then, use the Python app for
+Not ported yet (phase 5d): alerts, year review, quality / eval, backups and export, the coach runtime; and question generation from the data, document extraction, memory revert. Until then, use the Python app for
 them on the same database. The web app edits memory for the person at the keyboard; a model only ever proposes.
 
 ## Belgian banks

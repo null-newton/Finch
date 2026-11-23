@@ -81,6 +81,16 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["me", "transactions"]) => me_transactions(a, r),
         ("GET", ["me", "preferences"]) => { let u = r.user.clone().unwrap_or_else(super::User::owner); ok(json!({"prefs": u.prefs, "allowed": {"locale": ["fr-FR", "en-GB", "it-IT"], "theme": ["system", "light", "dark"], "default_member": null, "landing": ["dashboard", "transactions", "kids"]}, "stored": u.id != "owner"})) }
         ("PUT", ["me", "preferences"]) => put_prefs(a, r),
+        ("GET", ["net-worth"]) => { let s = a.snap()?; ok(crate::loans::net_worth(&s.ds, a.today(), s.ds.settings.asset_stale_months as i32)) }
+        ("GET", ["liabilities"]) => { let s = a.snap()?; ok(crate::loans::liabilities_view(&s.ds, a.today())) }
+        ("GET", ["loans", id]) => { let s = a.snap()?; crate::loans::loan_detail(&s.ds, id, a.today()).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such loan")) }
+        ("GET", ["loans", id, "early-repayment"]) => { let s = a.snap()?; let (ls, _) = crate::loans::liabilities(&s.ds.memory_dir); let l = ls.iter().find(|l| l.id == *id).ok_or_else(|| ApiErr::not_found("no such loan"))?;
+            let amt = r.q("amount").map(|x| x.replace(',', ".").parse::<f64>().map(crate::loans::cents).map_err(|_| ApiErr::new(422, "bad_amount", "amount: a number"))).transpose()?; ok(crate::loans::early_repayment(l, &crate::loans::compute(l, a.today()), amt, a.today())) }
+        ("GET", ["subs", "inventory"]) => { let s = a.view(r)?; ok(crate::subs::inventory(&s.ds, &s.rec, r.qb("include_ended", false), a.today())) }
+        ("GET", ["subs", "savings"]) => ok(crate::subs::savings_view(a.today())),
+        ("GET", ["rental", "properties"]) => { let s = a.snap()?; ok(crate::rental::list(&s.ds)) }
+        ("GET", ["rental", _, "tax"]) => ok(crate::rental::tax(r.qi("year", Some(chrono::Datelike::year(&a.today()) as i64 - 1), 2000, 2100)?.unwrap() as i32)),
+        ("GET", ["rental", id]) => { let s = a.snap()?; crate::rental::detail(&s.ds, id, r.qi("year", None, 2000, 2100)?.map(|y| y as i32)).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such rental property")) }
         ("GET", ["review", "ai"]) => ok(json!({"available": false, "web_search": false, "backend": a.cfg.llm_backend, "message": NOT_PORTED})),
         // the shell asks for these on every page: empty answers until their features are ported
         ("GET", ["alerts", "summary"]) => ok(json!({"ready": false, "open": 0, "new": 0, "high": 0})),

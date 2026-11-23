@@ -63,6 +63,11 @@ enum Cmd {
     /// Serve the web app on this machine and print a one-time login link
     #[command(subcommand)] Household(HhCmd),
     #[command(subcommand)] Memory(MemCmd),
+    /// Net worth: balances + assets - capital still due
+    Wealth { #[command(flatten)] out: Out },
+    #[command(subcommand)] Loans(LoanCmd),
+    #[command(subcommand)] Subs(SubsCmd),
+    #[command(subcommand)] Rental(RentCmd),
     #[command(subcommand)] Questions(QCmd),
     Ui { #[arg(long)] host: Option<String>, #[arg(long)] port: Option<u16>, /// API only: the page comes from `pnpm dev` (port 5173)
         #[arg(long)] dev: bool, #[arg(long)] no_browser: bool, /// print a fresh one-time login link for a running `finch ui` and exit
@@ -74,6 +79,20 @@ enum Cmd {
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
     Status }
+#[derive(Subcommand)] enum LoanCmd { /// Every loan with its capital still due
+    List,
+    /// One loan: the amortization schedule (Belgian equivalent monthly rate unless the file says proportional)
+    Show { id: String, #[arg(long)] rows: bool },
+    /// The legal maximum indemnity of repaying AMOUNT (EUR) early (all of it when omitted)
+    Repay { id: String, amount: Option<f64> } }
+#[derive(Subcommand)] enum SubsCmd { /// Every recurring cost with its contract and Belgian cancellation rule
+    Inventory { #[arg(long)] ended: bool, #[command(flatten)] out: Out },
+    /// Can this contract (id or series ref) be ended, when and how
+    Cancel { r#ref: String } }
+#[derive(Subcommand)] enum RentCmd { /// Rental properties and their last month
+    List,
+    /// One property: months, yearly totals, rent indexation
+    Show { id: String, #[arg(long)] year: Option<i32> } }
 #[derive(Subcommand)] enum MemCmd { /// Pending proposals (or --status all / accepted / rejected)
     Proposals { #[arg(long, default_value = "pending")] status: String },
     /// One proposal: what it changes, recomputed against the file as it is now
@@ -287,6 +306,23 @@ fn run() -> Result<()> {
             for r in &res { match r["status"].as_str() { Some("ok") => println!("  {}: pages={} new={} pending={}{}", s(&r["uid"]), s(&r["pages"]), s(&r["new"]), s(&r["pending"]), if r["replaced_imports"].as_u64().unwrap_or(0) > 0 { format!(" replaced_imports={}", s(&r["replaced_imports"])) } else { String::new() }), Some("failed") => { failed += 1; println!("  {}: FAILED - {}", s(&r["uid"]), s(&r["note"])); } _ => println!("  {}{}", if r["uid"].is_null() { String::new() } else { format!("{}: ", s(&r["uid"])) }, s(&r["note"])) } }
             if res.iter().any(|r| r["status"] == "ok" && r["new"].as_i64().unwrap_or(0) > 0) { println!("normalised {} transaction(s)", classify::normalize_all(&con, Some(&cfg.memory_dir))?); }
             if failed > 0 { anyhow::bail!("{failed} account(s) failed (the others were synced)"); } }
+        Cmd::Wealth { out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let v = finch::loans::net_worth(&ds, ds.today, ds.settings.asset_stale_months as i32);
+            if out.json { print_json(&v); } else { println!("net worth {} EUR (assets: bank {} + other {}; liabilities {}){}", s(&v["net_worth"]), s(&v["bank"]["total"]), s(&v["assets"]["total"]), s(&v["liabilities"]["total"]), if v["complete"] == true { String::new() } else { format!("  -- {} item(s) unknown, not counted", s(&v["n_unknown"])) });
+                for (k, x) in v["by_category"].as_object().unwrap() { println!("  {k:<12} {:>12}", s(x)); } for u in v["unknown"].as_array().into_iter().flatten() { println!("  unknown {} {}: {}", s(&u["kind"]), s(&u["id"]), s(&u["reason"])); } } }
+        Cmd::Loans(l) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let today = ds.today;
+            match l {
+                LoanCmd::List => for x in finch::loans::liabilities_view(&ds, today)["liabilities"].as_array().into_iter().flatten() { println!("  {:<20} {:<14} still due {:>12}  instalment {:>10}  {}", s(&x["id"]), s(&x["kind"]), x["remaining_capital"].as_str().unwrap_or("unknown"), x["schedule"]["payment"].as_str().unwrap_or("-"), x["schedule"]["status"].as_str().unwrap_or("")); },
+                LoanCmd::Show { id, rows } => { let (ls, _) = finch::loans::liabilities(&cfg.memory_dir); let lb = ls.iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("no loan {id:?}"))?; print_json(&finch::loans::compute(lb, today).to_json(rows)); }
+                LoanCmd::Repay { id, amount } => { let (ls, _) = finch::loans::liabilities(&cfg.memory_dir); let lb = ls.iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("no loan {id:?}"))?; print_json(&finch::loans::early_repayment(lb, &finch::loans::compute(lb, today), amount.map(finch::loans::cents), today)); }
+            } }
+        Cmd::Subs(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true);
+            match c {
+                SubsCmd::Inventory { ended, out } => { let v = finch::subs::inventory(&ds, &rec, ended, ds.today); if out.json { print_json(&v); } else { println!("{} services, {} EUR / month, {} EUR / year", s(&v["totals"]["services"]), s(&v["totals"]["monthly"]), s(&v["totals"]["yearly"]));
+                    lines(&v, "rows", |r| format!("  {:<28} {:<14} {:>9} /month  contract {:<8} can end now: {}", r["name"].as_str().unwrap_or("").chars().take(28).collect::<String>(), s(&r["group"]), r["monthly"].as_str().unwrap_or("?"), s(&r["contract"]["status"]), r["cancellation"]["can_cancel_now"].as_bool().map_or("unknown", |b| if b { "yes" } else { "no" }))); } }
+                SubsCmd::Cancel { r#ref } => { let v = finch::subs::inventory(&ds, &rec, true, ds.today); let row = v["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == r#ref.as_str() || x["contract_id"] == r#ref.as_str()).ok_or_else(|| anyhow::anyhow!("no service {:?} (see `finch subs inventory`)", r#ref))?; print_json(&row["cancellation"]); }
+            } }
+        Cmd::Rental(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
+            match c { RentCmd::List => print_json(&finch::rental::list(&ds)), RentCmd::Show { id, year } => print_json(&finch::rental::detail(&ds, &id, year).ok_or_else(|| anyhow::anyhow!("no rental property {id:?}"))?) } }
         Cmd::Memory(m) => { let st = finch::memstore::Store::new(&cfg, "cli")?;
             match m {
                 MemCmd::Proposals { status } => { let ps = finch::proposals::listing(&st, Some(&status)); if ps.is_empty() { println!("no {status} proposal"); }
