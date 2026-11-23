@@ -7,6 +7,7 @@ pub mod averages;
 pub mod cashflow;
 pub mod planning;
 pub mod recurring;
+pub mod review;
 
 use crate::{classify::rules::{categorised, Rules}, config::Config, memory, util::*};
 use anyhow::{bail, Result};

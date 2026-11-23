@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 5c)
+## Status (phase 5d)
 
 | Area | State |
 |---|---|
@@ -37,9 +37,13 @@ Python app, so both can work on the same data while the port is in progress.
 | Subscriptions and contracts: inventory of recurring costs with their `contracts/*.yaml`, price history, usage as stated, and Belgian cancellation rules (telecom 6 months, energy 1 month, insurance 3 months before the due date, tacitly renewed services 2 months) with their legal basis | ported (phase 5c, Belgian rules); alternatives, decisions, letters and contract drafts are not |
 | Rental property: linked account and loan, months of rent / costs / net / effort, missing rents, yearly totals, Belgian rent indexation from the owner's own health-index figures (`lease:` on the asset); tax: private letting is taxed on the cadastral income | ported (phase 5c, Belgian rules); no French scheme (Pinel) |
 | MCP `net_worth`, `loans_overview`, `rental_overview`, `subscriptions_inventory`, `cancellability` (kinds and refs only: never a lender, description or contract number) | ported (phase 5c) |
+| Backups and export: AES-256-GCM / scrypt archives in the Python app's formats (`AFCBK1` backups of the database + memory/, verified after writing and pruned to `backup.retention`; `AFCEX1` exports of every table, a transactions CSV and the memory files; `--plain` only at a terminal with a typed phrase) | ported (phase 5d) |
+| Alerts: signals (consents, failing syncs, unusual charges, price increases, low-balance forecasts, budgets, kid budgets local only) into the shared `alert_events` feed, dedupe / escalation / resolve, ack / snooze / mute, ntfy and Telegram channels (off by default, egress policy, quiet hours, weekly budget, minimal guarded text, first-run baseline), weekly digest | ported (phase 5d); e-mail and the macOS notification are not |
+| LLM usage per job / day with the egress destinations; the year in review (also as the MCP `year_review` tool) | ported (phase 5d) |
+| Coach: `finch coach ask` and the web chat (server-sent events) through `claude -p`, isolated, with finch's finance MCP server as its only tools; fails closed on an unexpected tool, plugin or MCP server; timeout, cancel, tool budget, unverified amounts and product-advice flags | ported (phase 5d, claude-code backend only) |
 | Web app (`web/`) | restyled with the toolbox look (Manrope / DM Mono, ink-teal and lime, drafting grid); pages and interactions unchanged; the bank connection asks you to paste the redirect address |
 
-Not ported yet (phase 5d): alerts, year review, quality / eval, backups and export, the coach runtime; and question generation from the data, document extraction, memory revert. Until then, use the Python app for
+Not ported yet: quality / evaluation (gold set, model comparisons), the coach with the anthropic-api / ollama / openai backends and its skills, e-mail and macOS alert channels, and question generation from the data, document extraction, memory revert. Until then, use the Python app for
 them on the same database. The web app edits memory for the person at the keyboard; a model only ever proposes.
 
 ## Belgian banks

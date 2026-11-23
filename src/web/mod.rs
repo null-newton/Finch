@@ -55,10 +55,10 @@ fn pdecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub struct Resp { pub status: u16, pub body: Vec<u8>, pub ctype: String, pub headers: Vec<(String, String)> }
+pub struct Resp { pub status: u16, pub body: Vec<u8>, pub ctype: String, pub headers: Vec<(String, String)>, /** a streamed body (server-sent events) */ pub stream: Option<std::sync::mpsc::Receiver<Vec<u8>>> }
 impl Resp {
     pub fn json(v: Value) -> Self { Self::with(200, v.to_string().into_bytes(), "application/json") }
-    pub fn with(status: u16, body: Vec<u8>, ctype: &str) -> Self { Self { status, body, ctype: ctype.into(), headers: vec![] } }
+    pub fn with(status: u16, body: Vec<u8>, ctype: &str) -> Self { Self { status, body, ctype: ctype.into(), headers: vec![], stream: None } }
     pub fn header(mut self, k: &str, v: &str) -> Self { self.headers.push((k.into(), v.into())); self }
 }
 #[derive(Debug)]
@@ -86,12 +86,12 @@ pub struct Snap { pub ds: Dataset, pub rec: Recurring }
 pub type HttpFactory = Arc<dyn Fn() -> Box<dyn Http> + Send + Sync>;
 
 pub struct App { pub cfg: Config, pub insecure: bool, pub sec: Security, pub static_dir: PathBuf, pub today: Option<NaiveDate>, pub http: HttpFactory,
-    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, views: Mutex<HashMap<String, Arc<Snap>>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>> }
+    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, views: Mutex<HashMap<String, Arc<Snap>>>, pub coach: Arc<dyn crate::coach::Spawner>, pub coach_job: Mutex<Option<(String, Arc<std::sync::atomic::AtomicBool>)>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>> }
 impl App {
     pub fn new(cfg: Config, insecure: bool, port: u16, dev: bool, static_dir: PathBuf, http: HttpFactory) -> Result<Self> {
         let secret = security::load_secret(&cfg.data_dir, cfg.ui_key_rotation_days)?;
         let sec = Security::new(secret, port, if dev { &DEV_PORTS } else { &[] }, cfg.ui_session_hours, &cfg.data_dir);
-        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), views: Mutex::new(HashMap::new()), inline_jobs: false, me: Default::default() })
+        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), views: Mutex::new(HashMap::new()), coach: Arc::new(crate::coach::ProcessSpawner), coach_job: Mutex::new(None), inline_jobs: false, me: Default::default() })
     }
     pub fn con(&self) -> Result<Connection> { db::connect(&self.cfg, db::Opts { insecure: self.insecure, ..Default::default() }) }
     /// Every write calls this: the next read recomputes the dataset.
@@ -182,12 +182,20 @@ impl App {
     }
 }
 /// The endpoints whose `dry_run=true` really previews (a stray flag on another write gets no lax budget and no audit exemption).
-fn previews(path: &str) -> bool { ["/api/v1/budgets", "/api/v1/goals", "/api/v1/annotations", "/api/v1/transactions/category", "/api/v1/household/", "/api/v1/questions/"].iter().any(|p| path.starts_with(p)) }
+fn previews(path: &str) -> bool { ["/api/v1/alerts/channels/", "/api/v1/budgets", "/api/v1/goals", "/api/v1/annotations", "/api/v1/transactions/category", "/api/v1/household/", "/api/v1/questions/"].iter().any(|p| path.starts_with(p)) }
 fn mime(ext: &str) -> &'static str {
     match ext { "js" => "text/javascript", "css" => "text/css", "png" => "image/png", "svg" => "image/svg+xml", "ico" => "image/x-icon", "webmanifest" => "application/manifest+json", "json" | "map" => "application/json",
         "woff2" => "font/woff2", "woff" => "font/woff", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp", "xml" => "application/xml", "txt" => "text/plain; charset=utf-8", "html" => "text/html; charset=utf-8", _ => "application/octet-stream" }
 }
 
+/// A response body fed by a channel: each message is written as soon as it arrives (server-sent events).
+pub struct ChanReader { pub rx: std::sync::mpsc::Receiver<Vec<u8>>, pub buf: Vec<u8>, pub pos: usize }
+impl Read for ChanReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() { match self.rx.recv() { Ok(b) => { self.buf = b; self.pos = 0; } Err(_) => return Ok(0) } }
+        let n = out.len().min(self.buf.len() - self.pos); out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]); self.pos += n; Ok(n)
+    }
+}
 /// The one-time link: the token sits in the URL fragment, which a browser never sends to a server, a log or a Referer.
 pub fn login_url(port: u16, dev: bool, token: &str) -> String { format!("{}/login#t={token}", if dev { "http://localhost:5173".to_string() } else { format!("http://127.0.0.1:{port}") }) }
 
@@ -198,9 +206,10 @@ pub fn serve(app: Arc<App>, host: &str, port: u16) -> Result<()> {
         while let Ok(mut rq) = s.recv() {
             let headers = rq.headers().iter().map(|h| (h.field.as_str().to_string(), h.value.as_str().to_string())).collect();
             let mut body = vec![]; if rq.as_reader().take(4 << 20).read_to_end(&mut body).is_err() { continue; }
-            let resp = a.handle(Req::new(&rq.method().to_string(), rq.url(), headers, body));
-            let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);
-            for (k, v) in std::iter::once(("Content-Type".to_string(), resp.ctype)).chain(resp.headers) { if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) { out.add_header(h); } }
+            let mut resp = a.handle(Req::new(&rq.method().to_string(), rq.url(), headers, body));
+            let hs: Vec<tiny_http::Header> = std::iter::once(("Content-Type".to_string(), resp.ctype.clone())).chain(resp.headers.clone()).filter_map(|(k, v)| tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).ok()).collect();
+            if let Some(rx) = resp.stream.take() { let _ = rq.respond(tiny_http::Response::new(tiny_http::StatusCode(resp.status), hs, ChanReader { rx, buf: vec![], pos: 0 }, None, None)); continue; }
+            let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status); for h in hs { out.add_header(h); }
             let _ = rq.respond(out);
         }
     }) }).collect();

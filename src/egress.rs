@@ -7,7 +7,9 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 
 /// (kind, external, local_only behaviour, offline behaviour, redaction mode, default host)
-pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 6] = [
+pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 8] = [
+    ("alerts.ntfy", true, "refused", "refused", "minimal-guarded", "the ntfy server of [alerts.ntfy] url"),
+    ("alerts.telegram", true, "refused", "refused", "minimal-guarded", "api.telegram.org"),
     ("enable_banking", true, "allowed", "refused", "none", "api.enablebanking.com"),
     ("llm.claude-code", true, "refused", "refused", "item-redact", "api.anthropic.com (via the claude CLI)"),
     ("llm.anthropic-api", true, "refused", "refused", "item-redact", "api.anthropic.com"),

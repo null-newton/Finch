@@ -1,7 +1,10 @@
 //! finch: a private personal-finance coach for one household (Rust port of ai-finance-coach). Numbers come from code.
 pub mod util;
+pub mod alerts;
 pub mod analytics;
+pub mod backup;
 pub mod classify;
+pub mod coach;
 pub mod config;
 pub mod db;
 pub mod egress;
@@ -10,9 +13,11 @@ pub mod memory;
 pub mod net;
 pub mod secrets;
 pub mod transfers;
+pub mod usage;
 pub mod mcp;
 pub mod privacy;
 pub mod household;
+pub mod insights;
 pub mod loans;
 pub mod subs;
 pub mod memstore;

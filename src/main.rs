@@ -63,6 +63,17 @@ enum Cmd {
     /// Serve the web app on this machine and print a one-time login link
     #[command(subcommand)] Household(HhCmd),
     #[command(subcommand)] Memory(MemCmd),
+    #[command(subcommand)] Backup(BackupCmd),
+    /// Everything finch holds, as one archive you own (encrypted unless --plain)
+    Export { #[arg(long)] out: Option<PathBuf>, /// an UNENCRYPTED zip: only at a terminal, after typing a confirmation phrase
+        #[arg(long)] plain: bool, /// decrypt an export archive into --to
+        #[arg(long)] decrypt: Option<PathBuf>, #[arg(long)] to: Option<PathBuf> },
+    #[command(subcommand)] Alerts(AlertCmd),
+    /// LLM calls, tokens and cost per job and day; the outbound destinations
+    Usage { #[arg(long, default_value_t = 30)] days: i64, #[command(flatten)] out: Out },
+    /// The year in review (default: the year of the last closed month)
+    Review { #[arg(long)] year: Option<i32>, #[command(flatten)] scope: ScopeArgs },
+    #[command(subcommand)] Coach(CoachCmd),
     /// Net worth: balances + assets - capital still due
     Wealth { #[command(flatten)] out: Out },
     #[command(subcommand)] Loans(LoanCmd),
@@ -79,6 +90,25 @@ enum Cmd {
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
     Status }
+#[derive(Subcommand)] enum BackupCmd { /// Write an encrypted, verified backup of the database and memory/ (then prune to the retention)
+    Create,
+    List,
+    /// Decrypt and check an archive
+    Verify { file: PathBuf },
+    /// Restore into an empty folder (never overwrites unless --force)
+    Restore { file: PathBuf, #[arg(long)] to: PathBuf, #[arg(long)] force: bool } }
+#[derive(Subcommand)] enum AlertCmd { /// Evaluate the signals and send to the enabled channels (--dry-run: write and send nothing; --no-send: keep the events only)
+    Check { #[arg(long)] dry_run: bool, #[arg(long)] no_send: bool },
+    /// The open alerts
+    List { #[arg(long)] all: bool },
+    /// The channels and whether they are ready
+    Channels,
+    Ack { id: String },
+    Snooze { id: String, #[arg(long, default_value_t = 7)] days: i64 },
+    /// The weekly summary of the feed (local)
+    Digest }
+#[derive(Subcommand)] enum CoachCmd { /// Ask the coach a question (Claude Code with finch's redacted finance tools only)
+    Ask { question: String } }
 #[derive(Subcommand)] enum LoanCmd { /// Every loan with its capital still due
     List,
     /// One loan: the amortization schedule (Belgian equivalent monthly rate unless the file says proportional)
@@ -323,6 +353,35 @@ fn run() -> Result<()> {
             } }
         Cmd::Rental(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
             match c { RentCmd::List => print_json(&finch::rental::list(&ds)), RentCmd::Show { id, year } => print_json(&finch::rental::detail(&ds, &id, year).ok_or_else(|| anyhow::anyhow!("no rental property {id:?}"))?) } }
+        Cmd::Backup(b) => match b {
+            BackupCmd::Create => { let con = open(true)?; let (p, pruned) = finch::backup::create(&cfg, &con, None)?; println!("backup written and verified: {}", p.display()); for x in pruned { println!("pruned {}", x.display()); } }
+            BackupCmd::List => for p in finch::backup::list(&cfg) { println!("{}  {} bytes", p.display(), std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)); },
+            BackupCmd::Verify { file } => println!("ok: {} entries", finch::backup::verify(&file, None)?.len()),
+            BackupCmd::Restore { file, to, force } => println!("restored {} file(s) into {}", finch::backup::restore(&file, &to, force, None)?.len(), to.display()),
+        },
+        Cmd::Export { out, plain, decrypt, to } => {
+            if let Some(f) = decrypt { let to = to.ok_or_else(|| anyhow::anyhow!("--decrypt needs --to DIR"))?; println!("decrypted into {}", finch::backup::decrypt_export(&f, &to, None)?.display()); return Ok(()); }
+            if plain { use std::io::{IsTerminal, Write}; if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { bail!("--plain writes an UNENCRYPTED archive of your whole financial life: run it in an interactive terminal"); }
+                print!("This writes an UNENCRYPTED archive. Type {} to continue: ", finch::backup::PLAIN_PHRASE); std::io::stdout().flush()?; let mut l = String::new(); std::io::stdin().read_line(&mut l)?; if l.trim() != finch::backup::PLAIN_PHRASE { println!("nothing written"); return Ok(()); } }
+            let con = open(true)?; println!("export written: {}", finch::backup::export(&cfg, &con, out, plain, None)?.display()); }
+        Cmd::Alerts(c) => { let con = open(true)?; let st = finch::alerts::Settings::load(&cfg)?;
+            match c {
+                AlertCmd::Check { dry_run, no_send } => { let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let now = chrono::Utc::now();
+                    let v = finch::alerts::evaluate(&con, &ds, &rec, &st, now, dry_run)?; println!("{} signal(s): {} new, {} escalated, {} resolved{}", s(&v["candidates"]), v["new"].as_array().map_or(0, |a| a.len()), v["escalated"].as_array().map_or(0, |a| a.len()), v["resolved"].as_array().map_or(0, |a| a.len()), if dry_run { " (dry run: nothing stored)" } else { "" });
+                    if !no_send { for r in finch::alerts::dispatch(&con, &cfg, &st, now, dry_run, &net::UreqHttp::new(30))? { println!("  {:<9} {:<10} {}{}", s(&r["channel"]), s(&r["status"]), r["reason"].as_str().unwrap_or(""), r["message"]["body"].as_str().map(|b| format!("\n    {}", b.replace('\n', "\n    "))).unwrap_or_default()); } } }
+                AlertCmd::List { all } => for e in finch::alerts::listing(&con, Some(all))? { if !all && !["new", "sent"].contains(&e["status"].as_str().unwrap_or("")) { continue; } println!("  {} {:<7} {:<10} {:<18} {}", s(&e["id"]), s(&e["severity"]), s(&e["status"]), s(&e["kind"]), s(&e["title"])); },
+                AlertCmd::Channels => print_json(&finch::alerts::channels_view(&con, &cfg, &st)?),
+                AlertCmd::Ack { id } => println!("{}", if finch::alerts::act(&con, &id, "ack", None, chrono::Local::now().date_naive())? { "acknowledged" } else { "no such alert" }),
+                AlertCmd::Snooze { id, days } => println!("{}", if finch::alerts::act(&con, &id, "snooze", Some(days), chrono::Local::now().date_naive())? { "snoozed" } else { "no such alert" }),
+                AlertCmd::Digest => print!("{}", s(&finch::alerts::digest(&con, chrono::Local::now().date_naive())?["markdown"])),
+            } }
+        Cmd::Usage { days, out } => { let con = open(true)?; let v = finch::usage::summary(&con, &cfg, days, chrono::Utc::now())?; if out.json { print_json(&v); } else { let t = &v["totals"]; println!("LLM usage, last {days} days: {} call(s), {} tokens in / {} out, {} USD ({} notional on a subscription)", s(&t["calls"]), s(&t["tokens_in"]), s(&t["tokens_out"]), s(&t["cost_usd"]), s(&t["notional_cost_usd"]));
+            lines(&v, "lines", |l| format!("  {:<16} {:<14} {:<20} {:>5} calls  {:>8} USD", s(&l["job"]), s(&l["backend"]), l["model"].as_str().unwrap_or("?"), s(&l["calls"]), l["cost_usd"].as_f64().map_or("unknown".into(), |c| format!("{c:.4}")))); } }
+        Cmd::Review { year, scope: sa } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; print_json(&finch::analytics::review::year_review(&ds, year, &scope(&sa), 10)); }
+        Cmd::Coach(CoachCmd::Ask { question }) => { use std::io::Write; let con = open(true)?; let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut emit = |ev: &str, d: serde_json::Value| { match ev { "delta" => { print!("{}", d["text"].as_str().unwrap_or("")); let _ = std::io::stdout().flush(); } "tool_call" => eprintln!("[tool {}]", d["name"].as_str().unwrap_or("")), "proposal" => eprintln!("\n[proposal {}: review it, then `{}`]", s(&d["id"]), s(&d["command"])),
+                "notice" | "error" => eprintln!("\n[{}] {}", ev, d["message"].as_str().unwrap_or("")), "answer" => { println!(); if let Some(u) = d["unverified_numbers"].as_array().filter(|u| !u.is_empty()) { eprintln!("[warning: amounts not returned by a tool: {}]", u.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")); } } _ => {} } };
+            finch::coach::run(&cfg, cli.insecure, &question, &finch::coach::ProcessSpawner, cancel, Some(&con), &mut emit)?; }
         Cmd::Memory(m) => { let st = finch::memstore::Store::new(&cfg, "cli")?;
             match m {
                 MemCmd::Proposals { status } => { let ps = finch::proposals::listing(&st, Some(&status)); if ps.is_empty() { println!("no {status} proposal"); }

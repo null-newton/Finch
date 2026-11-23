@@ -91,10 +91,25 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["rental", "properties"]) => { let s = a.snap()?; ok(crate::rental::list(&s.ds)) }
         ("GET", ["rental", _, "tax"]) => ok(crate::rental::tax(r.qi("year", Some(chrono::Datelike::year(&a.today()) as i64 - 1), 2000, 2100)?.unwrap() as i32)),
         ("GET", ["rental", id]) => { let s = a.snap()?; crate::rental::detail(&s.ds, id, r.qi("year", None, 2000, 2100)?.map(|y| y as i32)).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such rental property")) }
+        ("GET", ["alerts"]) => { let s = crate::alerts::Settings::load(&a.cfg).map_err(ApiErr::rejected)?; ok(crate::alerts::alerts_view(&a.con()?, &s, r.q("status"), r.q("kind"), r.q("severity"), r.qb("include_resolved", false))?) }
+        ("GET", ["alerts", "summary"]) => ok(crate::alerts::summary(&a.con()?)?),
+        ("GET", ["alerts", "channels"]) => { let s = crate::alerts::Settings::load(&a.cfg).map_err(ApiErr::rejected)?; ok(crate::alerts::channels_view(&a.con()?, &a.cfg, &s)?) }
+        ("GET", ["alerts", "digest"]) => ok(crate::alerts::digest(&a.con()?, a.today())?),
+        ("POST", ["alerts", "check"]) => { let s = crate::alerts::Settings::load(&a.cfg).map_err(ApiErr::rejected)?; let snap = a.snap()?; let v = crate::alerts::evaluate(&a.con()?, &snap.ds, &snap.rec, &s, chrono::Utc::now(), false)?; a.touch(); ok(v) }
+        ("POST", ["alerts", "channels", name, "test"]) => { let s = crate::alerts::Settings::load(&a.cfg).map_err(ApiErr::rejected)?; if !crate::alerts::CHANNELS.contains(name) { return Err(ApiErr::not_found("no such channel")); }
+            let sample = vec![json!({"kind": "unusual_charge", "severity": "high", "payload": {"amount_c": 12345}}), json!({"kind": "consent", "severity": "medium", "payload": {}})]; let con = a.con()?; let g = crate::privacy::Guard::new(&a.cfg, Some(&con));
+            let (title, body, note) = crate::alerts::compose(&sample, &s, &g).unwrap_or(("Coach alerts".into(), String::new(), Some("refused by the privacy filter"))); let pr = if s.enabled(name) { crate::alerts::problems(&a.cfg, &s, name) } else { vec!["the channel is not enabled".into()] };
+            ok(json!({"dry_run": true, "sent": false, "channel": name, "enabled": s.enabled(name), "ready": s.enabled(name) && pr.is_empty(), "problems": pr, "detail": s.external_detail, "note": note, "message": {"title": title, "body": body}, "text": format!("{title}\n{body}"), "sample": "two sample alerts (one high)"})) }
+        ("POST", ["alerts", "kinds", k, what]) => { let b = r.json()?; crate::alerts::kind_act(&a.con()?, k, what, b["days"].as_i64(), a.today()).map_err(ApiErr::rejected)?; a.touch(); ok(json!({"kind": k, "done": what})) }
+        ("POST", ["alerts", id, what]) => { let b = r.json()?; if !crate::alerts::act(&a.con()?, id, what, b["days"].as_i64(), a.today()).map_err(ApiErr::rejected)? { return Err(ApiErr::not_found("no such alert")); } a.touch(); ok(json!({"id": id, "done": what})) }
+        ("GET", ["usage"]) => ok(crate::usage::summary(&a.con()?, &a.cfg, r.qi("days", Some(30), 1, 365)?.unwrap(), chrono::Utc::now())?),
+        ("GET", ["analytics", "year-review"]) => { let s = a.view(r)?; let sc = scope(r, &s.ds)?; ok(crate::analytics::review::year_review(&s.ds, r.qi("year", None, 2000, 2100)?.map(|y| y as i32), &sc, 10)) }
+        ("GET", ["coach", "status"]) => ok(crate::coach::status(&a.cfg, a.coach.as_ref(), a.coach_job.lock().unwrap().as_ref().map(|j| j.0.clone()))),
+        ("GET", ["coach", "prompts"]) => ok(json!({"prompts": crate::coach::quick_prompts()})),
+        ("POST", ["coach", "stream"]) => coach_stream(a, r),
+        ("POST", ["coach", "jobs", id, "cancel"]) => { match a.coach_job.lock().unwrap().as_ref() { Some((j, c)) if j == id => { c.store(true, std::sync::atomic::Ordering::SeqCst); ok(json!({"id": id, "cancelled": true})) } _ => Err(ApiErr::not_found("no such running job")) } }
         ("GET", ["review", "ai"]) => ok(json!({"available": false, "web_search": false, "backend": a.cfg.llm_backend, "message": NOT_PORTED})),
         // the shell asks for these on every page: empty answers until their features are ported
-        ("GET", ["alerts", "summary"]) => ok(json!({"ready": false, "open": 0, "new": 0, "high": 0})),
-        ("GET", ["coach", "status"]) => ok(json!({"configured": false, "backend": a.cfg.coach_backend, "model": "", "message": NOT_PORTED, "max_tool_calls": 0, "timeout_seconds": 0, "busy": false, "current_job": null, "tools": []})),
         _ => super::memory_routes::route(a, r, &seg).unwrap_or_else(|| Err(ApiErr::new(404, "not_ported", NOT_PORTED))),
     }
 }
@@ -401,41 +416,10 @@ fn subscriptions(a: &App, r: &Req) -> R {
     ok(json!({"as_of": s.ds.today.to_string(), "series": rows, "totals": {"active_monthly": money_str(active.iter().map(|r| cents_of(&r["monthly_cost"])).sum()), "active_yearly": money_str(active.iter().map(|r| cents_of(&r["yearly_cost"])).sum()), "n_active": active.len(), "n_missing_contract": active.iter().filter(|r| r["missing_contract"] == true).count()},
         "by_cadence": s.rec.json["by_cadence"], "coverage": s.rec.json["coverage"]}))
 }
-fn iid(parts: &[&str]) -> String { format!("ins_{}", &sha1_hex(&parts.join("|"))[..10]) }
 fn insights(a: &App, r: &Req) -> R {
-    let s = a.view(r)?; let sc = scope(r, &s.ds)?; let con = a.con()?; let ds = &s.ds;
-    let an = anomalies::detect(ds, &sc, &s.rec, &anomalies::dismissed_ids(&con)?, false);
-    let dis: HashSet<String> = con.prepare("SELECT id FROM price_change_dismissals")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>().map_err(anyhow::Error::from)?;
-    let pcs = recurring::price_changes(ds, &s.rec, None, false, &dis, false); let fc = planning::forecast(ds, &s.rec, &sc, 90, false); let bs = planning::status(ds, &s.rec, None);
-    let mut cards = vec![];
-    for x in an["anomalies"].as_array().into_iter().flatten() {
-        let title = match x["type"].as_str().unwrap_or("") { "category_spike" => "Spending spike", "duplicate_charge" => "Possible duplicate charge", "new_merchant" => "New merchant", "large_transaction" => "Large payment", t => t }.to_string();
-        cards.push(json!({"id": x["id"], "kind": "anomaly", "subtype": x["type"], "severity": x["severity"], "title": title, "body": x["message"], "amount": x["amount"], "date": x["period"], "subject": x["subject"], "evidence": x["evidence"].as_array().map(|e| e.iter().take(20).cloned().collect::<Vec<_>>()), "persist": "anomaly"}));
-    }
-    for c in pcs["changes"].as_array().into_iter().flatten() {
-        let up = c["direction"] == "increase"; let pct = c["pct"].as_f64().unwrap_or(0.0).abs();
-        cards.push(json!({"id": c["id"], "kind": "price_change", "subtype": c["direction"], "severity": if up { "medium" } else { "low" }, "title": format!("{}: price {} {:.0}%", c["entity"].as_str().unwrap_or(""), if up { "up" } else { "down" }, pct * 100.0),
-            "body": format!("{} -> {} EUR per {} payment, about {} EUR a year{}.", c["old"].as_str().unwrap_or(""), c["new"].as_str().unwrap_or(""), c["cadence"].as_str().unwrap_or(""), money_str(cents_of(&c["yearly_impact"]).abs()), if c["confirmed"] == true { "" } else { " (not yet confirmed by a second payment)" }),
-            "amount": c["yearly_impact"], "date": c["date"], "subject": c["entity"], "evidence": [c["tx_key"].clone()], "persist": "price_change"}));
-    }
-    for acc in std::iter::once(&fc["household"]).chain(fc["accounts"].as_array().into_iter().flatten()) {
-        let (neg, risk) = (acc["first_negative"].as_str(), acc["first_at_risk"].as_str()); let flags: Vec<String> = acc["flags"].as_array().into_iter().flatten().filter_map(|f| f.as_str().map(String::from)).collect();
-        if neg.is_none() && risk.is_none() && flags.is_empty() { continue; }
-        let label = acc["label"].as_str().unwrap_or("Household"); let when = neg.or(risk);
-        let lowest = acc["min_balance"].as_str().map(|m| format!("Lowest expected {m} EUR on {}.", acc["min_date"].as_str().unwrap_or(""))).unwrap_or_default();
-        let body = match (neg, risk) { (Some(n), _) => format!("Projected below zero from {n}. {lowest}"), (_, Some(r)) => format!("Could run short around {r} (low end of the band). {lowest}"), _ => lowest };
-        cards.push(json!({"id": iid(&["forecast", acc["account"].as_str().unwrap_or("household"), when.unwrap_or(""), &flags.join(",")]), "kind": "forecast", "subtype": if neg.is_some() { "negative" } else { "at_risk" }, "severity": if neg.is_some() { "high" } else { "medium" },
-            "title": format!("{label}: balance {}", if neg.is_some() { "projected negative" } else { "at risk" }), "body": body, "amount": acc["min_balance"], "date": when, "subject": label, "evidence": [], "persist": "ui", "flags": flags}));
-    }
-    for p in bs["budgets"].as_array().into_iter().flatten().filter(|p| p["status"] == "over" || p["status"] == "at_risk") {
-        let over = p["status"] == "over"; let g = |k: &str| p[k].as_str().unwrap_or("").to_string();
-        cards.push(json!({"id": iid(&["budget", &g("id"), &g("month"), &g("status")]), "kind": "budget", "subtype": p["status"], "severity": if over { "high" } else { "medium" }, "title": format!("Budget {}: {}", g("target"), if over { "over" } else { "on track to overrun" }),
-            "body": format!("{} EUR spent of {} EUR in {}; projected {} EUR by month end.", g("spent"), g("available"), g("month"), g("projected")), "amount": p["remaining"], "date": p["month"], "subject": p["target"], "evidence": p["evidence"], "persist": "ui"}));
-    }
-    let sev = |c: &Value| ["high", "medium", "low"].iter().position(|x| c["severity"] == *x).unwrap_or(3);
-    cards.sort_by(|x, y| y["date"].as_str().unwrap_or("").cmp(x["date"].as_str().unwrap_or(""))); cards.sort_by_key(sev);
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new(); for c in &cards { *counts.entry(c["kind"].as_str().unwrap_or("").into()).or_default() += 1; }
-    ok(json!({"as_of": ds.today.to_string(), "cards": cards, "hidden": an["dismissed"].as_u64().unwrap_or(0) as usize + dis.len(), "alerts": {"open": 0, "high": 0}, "counts": counts, "coach": {"configured": false, "items": [], "hidden": 0, "message": NOT_PORTED}}))
+    let s = a.view(r)?; let sc = scope(r, &s.ds)?; let (cards, hidden) = crate::insights::cards(&s.ds, &s.rec, &a.con()?, &sc)?; let mut counts: BTreeMap<String, usize> = BTreeMap::new(); for c in &cards { *counts.entry(c["kind"].as_str().unwrap_or("").into()).or_default() += 1; }
+    let al = crate::alerts::summary(&a.con()?).unwrap_or(json!({"open": 0, "high": 0}));
+    ok(json!({"as_of": s.ds.today.to_string(), "cards": cards, "hidden": hidden, "alerts": {"open": al["open"], "high": al["high"]}, "counts": counts, "coach": {"configured": false, "items": [], "hidden": 0, "message": NOT_PORTED}}))
 }
 fn dismiss(a: &App, id: &str) -> R {
     let con = a.con()?;
@@ -564,4 +548,20 @@ fn put_prefs(a: &App, r: &Req) -> R {
             "default_member" => !u.is_child() && (v.is_empty() || v == household::JOINT || s.ds.people.get(&v).is_some()), _ => false };
         if !ok { return Err(ApiErr::rejected(format!("preference {k}: {v:?} is not allowed"))); } merged.insert(k.clone(), v.into()); }
     a.con()?.execute("UPDATE ui_users SET prefs=? WHERE id=?", params![Value::Object(merged.clone()).to_string(), u.id])?; ok(json!({"prefs": merged}))
+}
+
+/// Ask the coach: the answer streams as server-sent events from a worker thread (one question at a time).
+fn coach_stream(a: &App, r: &Req) -> R {
+    let q = r.json()?["question"].as_str().map(str::trim).filter(|q| !q.is_empty() && q.chars().count() <= 4000).map(String::from).ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: question: 1 to 4000 characters"))?;
+    let st = crate::coach::status(&a.cfg, a.coach.as_ref(), None); if st["configured"] != true { return Err(ApiErr::new(409, "coach_unavailable", st["message"].as_str().unwrap_or(""))); }
+    let id = format!("job_{:08x}", rand::random::<u32>()); let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    { let mut j = a.coach_job.lock().unwrap(); if let Some((cur, _)) = j.as_ref() { return Err(ApiErr::new(409, "coach_busy", &format!("the coach is answering another question ({cur})"))); } *j = Some((id.clone(), cancel.clone())); }
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>(); let sse = |ev: &str, d: &Value| format!("event: {ev}\ndata: {d}\n\n").into_bytes();
+    let _ = tx.send(sse("meta", &json!({"job_id": id})));
+    let (cfg, insecure, sp) = (a.cfg.clone(), a.insecure, a.coach.clone()); let app = a.me.get().and_then(|w| w.upgrade());
+    let work = move |a: &App| { let con = a.con().ok(); let mut emit = |ev: &str, d: Value| { let _ = tx.send(sse(ev, &d)); };
+        if let Err(e) = crate::coach::run(&cfg, insecure, &q, sp.as_ref(), cancel, con.as_ref(), &mut emit) { emit("error", json!({"code": "failed", "message": e.root_cause().to_string().chars().take(300).collect::<String>()})); emit("done", json!({})); }
+        *a.coach_job.lock().unwrap() = None; };
+    match app { Some(app) => { std::thread::spawn(move || work(&app)); } None => work(a) }
+    let mut resp = Resp::with(200, vec![], "text/event-stream"); resp.stream = Some(rx); Ok(resp.header("X-Accel-Buffering", "no"))
 }

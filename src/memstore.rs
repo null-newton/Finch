@@ -305,9 +305,11 @@ fn comments(t: &str) -> Vec<String> { t.lines().filter_map(|l| { let s = l.trim(
 /// Comments of the old text that are gone from the new one.
 pub fn lost_comments(old: &str, new: &str) -> Vec<String> { let mut n = comments(new); comments(old).into_iter().filter(|c| match n.iter().position(|x| x == c) { Some(i) => { n.remove(i); false } None => true }).collect() }
 pub fn unified(old: &str, new: &str, rel: &str) -> String { if old == new { return String::new(); } similar::TextDiff::from_lines(old, new).unified_diff().context_radius(3).header(&format!("a/{rel}"), &format!("b/{rel}")).to_string() }
-pub fn atomic_write(p: &Path, text: &str) -> Result<()> {
+pub fn atomic_write(p: &Path, text: &str) -> Result<()> { atomic_write_bytes(p, text.as_bytes()) }
+/// Write a file atomically, readable by the owner only.
+pub fn atomic_write_bytes(p: &Path, data: &[u8]) -> Result<()> {
     if let Some(d) = p.parent() { std::fs::create_dir_all(d)?; }
-    let tmp = p.with_extension(format!("{}.tmp", p.extension().and_then(|e| e.to_str()).unwrap_or(""))); std::fs::write(&tmp, text)?;
+    let tmp = p.with_extension(format!("{}.tmp", p.extension().and_then(|e| e.to_str()).unwrap_or(""))); std::fs::write(&tmp, data)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?; }
     std::fs::rename(&tmp, p)?; Ok(())
 }

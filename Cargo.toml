@@ -23,6 +23,7 @@ sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 keychain = ["dep:keyring"]
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
@@ -37,17 +38,20 @@ regex = "1"
 roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled", "functions", "backup"] }
 rust_decimal = "1"
+scrypt = { version = "0.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
 similar = "2"
+tar = "0.4"
 thiserror = "2"
 tiny_http = "0.12"
 toml = "0.8"
 ureq = { version = "2", features = ["json"] }
 url = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1"
 rand = "0.8"
 base64 = "0.22"
