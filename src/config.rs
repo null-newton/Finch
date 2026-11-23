@@ -17,7 +17,7 @@ pub struct Config {
     pub knn_enabled: bool, pub knn_threshold: f64, pub knn_examples: i64, pub sync_daily_limit: i64, pub privacy_egress_journal: bool, pub coach_claude_env: Vec<String>, pub coach_claude_restricted: bool,
     pub coach_backend: String, pub import_profiles_dir: PathBuf, pub backup_dir: PathBuf, pub backup_retention: i64,
     pub transfer_window_days: i64, pub transfer_cross_bank_window_days: i64, pub transfer_min_confidence: f64, pub transfer_auto_link: bool, pub transfer_topup_merchants: Vec<String>, pub privacy_model_detail: String, pub privacy_local_only: bool, pub privacy_offline: bool,
-    pub privacy_web_enrich: bool, pub ui_host: String, pub ui_port: i64, pub analytics: Table, pub alerts: Table,
+    pub privacy_web_enrich: bool, pub ui_host: String, pub ui_port: i64, pub ui_session_hours: i64, pub ui_key_rotation_days: i64, pub ui_open_browser: bool, pub health_stale_days: i64, pub analytics: Table, pub alerts: Table,
     /// (key, value, source) for `finch config show`; never a secret.
     pub rows: Vec<(String, String, String)>,
 }
@@ -97,11 +97,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         transfer_window_days: p.i("transfers.window_days", 3)?, transfer_cross_bank_window_days: p.i("transfers.cross_bank_window_days", 5)?, transfer_min_confidence: p.f("transfers.min_confidence", 0.85)?,
         transfer_auto_link: p.b("transfers.auto_link", false)?, transfer_topup_merchants: p.l("transfers.topup_merchants", &["REVOLUT", "PAYPAL", "WISE"])?.into_iter().map(|x| x.trim().to_uppercase()).collect(), privacy_model_detail: p.s("privacy.model_detail", "coarse", None)?,
         privacy_local_only: p.b("privacy.local_only", false)?, privacy_offline: p.b("privacy.offline", false)?, privacy_web_enrich: p.b("privacy.web_enrich", false)?,
-        ui_host: p.s("ui.host", "127.0.0.1", None)?, ui_port: p.i("ui.port", 8765)?,
+        ui_host: p.s("ui.host", "127.0.0.1", None)?, ui_port: p.i("ui.port", 8765)?, ui_session_hours: p.i("ui.session_hours", 12)?, ui_key_rotation_days: p.i("ui.key_rotation_days", 30)?, ui_open_browser: p.b("ui.open_browser", true)?, health_stale_days: p.i("health.stale_days", 2)?,
         analytics: raw.get("analytics").and_then(Value::as_table).cloned().unwrap_or_default(), alerts: raw.get("alerts").and_then(Value::as_table).cloned().unwrap_or_default(),
         root: root.clone(), config_path: cfg_path.clone(), data_dir: data_dir.clone(), memory_dir: memory_dir.clone(), db_path: db_path.clone(), rows: vec![],
     };
     if !(0.0 < c.knn_threshold && c.knn_threshold <= 1.0) { bail!("classify.knn_threshold must be a number in (0, 1]"); }
+    if !(1..=720).contains(&c.ui_session_hours) || c.ui_key_rotation_days < 1 { bail!("ui.session_hours must be 1..720 and ui.key_rotation_days >= 1"); }
     if c.sync_daily_limit < 1 { bail!("sync.daily_limit must be >= 1"); }
     for r in &c.llm_allowlist { if fancy_regex::Regex::new(r).is_err() { bail!("classify.llm_allowlist: bad regex {r:?}"); } }
     if c.coach_claude_env.iter().any(|n| !n.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')) { bail!("coach.claude_env must be a list of environment variable names"); }

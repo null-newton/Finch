@@ -1,62 +1,60 @@
 @import "tailwindcss";
 
-/* dark mode: follows the system, or the explicit toggle (data-theme on <html>) */
+@font-face { font-family: 'DM Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/dm-mono-latin-400.woff2) format('woff2'); }
+@font-face { font-family: 'DM Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url(/fonts/dm-mono-latin-500.woff2) format('woff2'); }
+@font-face { font-family: 'Manrope'; font-style: normal; font-weight: 200 800; font-display: swap; src: url(/fonts/manrope-latin-variable.woff2) format('woff2'); }
+
+/* dark mode (the toolbox look, the default): follows the system, or the explicit toggle (data-theme on <html>) */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
+/* light: the same identity on paper (ink-teal text, the lime's dark olive as accent so it stays readable) */
 :root {
   color-scheme: light;
-  --bg: #f5f3ee;
-  --surface: #fffefb;
-  --surface-2: #efece4;
-  --border: #e2ded3;
-  --border-strong: #cbc6b8;
-  --text: #1b1f1d;
-  --muted: #626459;
-  --faint: #70715f;
-  --accent: #1f5fbf;
-  --accent-hover: #194f9f;
-  --accent-fg: #ffffff;
-  --accent-soft: #e5edfa;
-  --pos: #17704a;
-  --pos-soft: #e1f1e8;
-  --neg: #b3382a;
-  --neg-soft: #f8e4df;
-  --warn: #8f5a00;
-  --warn-soft: #f8ecd0;
-  --ring: #1f5fbf;
-  /* validated categorical series (see the dataviz palette): blue, orange, aqua, yellow, magenta, green, violet, red */
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
-  --grid: #e6e2d8;
-  --shadow: 0 1px 2px rgb(40 36 20 / 0.06), 0 1px 1px rgb(40 36 20 / 0.04);
+  --bg: #eef5f2; --surface: #f8fbfa; --surface-2: #e3ece9; --border: #d8e2df; --border-strong: #bdc9c6;
+  --text: #071013; --muted: #526568; --faint: #5f7173;
+  --accent: #506b16; --accent-hover: #3c5015; --accent-fg: #f8ffe6; --accent-soft: #efffc4;
+  --cyan: #168f8c;
+  --pos: #12706d; --pos-soft: #d6fffc; --neg: #b3382a; --neg-soft: #f8e4df; --warn: #8f5a00; --warn-soft: #f8ecd0;
+  --ring: #506b16;
+  --s1: #168f8c; --s2: #66871c; --s3: #d95926; --s4: #c98500; --s5: #d55181; --s6: #0e5f5d; --s7: #4a3aa7; --s8: #e34948;
+  --grid: #d8e2df;
+  --grid-line: rgb(7 16 19 / 0.035); --bloom: rgb(22 143 140 / 0.08);
+  --shadow: none;
 }
 :root:where(:not([data-theme="light"])) {
   @media (prefers-color-scheme: dark) {
     color-scheme: dark;
-    --bg: #121413; --surface: #1a1c1a; --surface-2: #232622; --border: #2d302c; --border-strong: #42463f;
-    --text: #ecebe4; --muted: #a3a498; --faint: #8e9084;
-    --accent: #5b9bf0; --accent-hover: #7cb0f5; --accent-fg: #0b0e12; --accent-soft: #1b2a41;
-    --pos: #56c58d; --pos-soft: #163325; --neg: #f0877a; --neg-soft: #3a1d19; --warn: #e6b04a; --warn-soft: #3a2d10;
-    --ring: #7cb0f5;
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
-    --grid: #2a2d29;
-    --shadow: none;
+  --bg: #071013; --surface: #0d181c; --surface-2: #111f24; --border: #24373c; --border-strong: #3a5056;
+  --text: #eef5f2; --muted: #9baba8; --faint: #7e918f;
+  --accent: #c8ff3d; --accent-hover: #d7ff70; --accent-fg: #071013; --accent-soft: rgb(200 255 61 / 0.12);
+  --cyan: #4ee6e0;
+  --pos: #4ee6e0; --pos-soft: rgb(78 230 224 / 0.12); --neg: #ff8a7a; --neg-soft: rgb(255 138 122 / 0.12); --warn: #f5c451; --warn-soft: rgb(245 196 81 / 0.12);
+  --ring: #c8ff3d;
+  --s1: #4ee6e0; --s2: #c8ff3d; --s3: #f5a35c; --s4: #f5c451; --s5: #e87ba4; --s6: #18aaa6; --s7: #9085e9; --s8: #ff8a7a;
+  --grid: rgb(255 255 255 / 0.06);
+  --grid-line: rgb(255 255 255 / 0.025); --bloom: rgb(78 230 224 / 0.11);
+  --shadow: none;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #121413; --surface: #1a1c1a; --surface-2: #232622; --border: #2d302c; --border-strong: #42463f;
-  --text: #ecebe4; --muted: #a3a498; --faint: #8e9084;
-  --accent: #5b9bf0; --accent-hover: #7cb0f5; --accent-fg: #0b0e12; --accent-soft: #1b2a41;
-  --pos: #56c58d; --pos-soft: #163325; --neg: #f0877a; --neg-soft: #3a1d19; --warn: #e6b04a; --warn-soft: #3a2d10;
-  --ring: #7cb0f5;
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
-  --grid: #2a2d29;
+  --bg: #071013; --surface: #0d181c; --surface-2: #111f24; --border: #24373c; --border-strong: #3a5056;
+  --text: #eef5f2; --muted: #9baba8; --faint: #7e918f;
+  --accent: #c8ff3d; --accent-hover: #d7ff70; --accent-fg: #071013; --accent-soft: rgb(200 255 61 / 0.12);
+  --cyan: #4ee6e0;
+  --pos: #4ee6e0; --pos-soft: rgb(78 230 224 / 0.12); --neg: #ff8a7a; --neg-soft: rgb(255 138 122 / 0.12); --warn: #f5c451; --warn-soft: rgb(245 196 81 / 0.12);
+  --ring: #c8ff3d;
+  --s1: #4ee6e0; --s2: #c8ff3d; --s3: #f5a35c; --s4: #f5c451; --s5: #e87ba4; --s6: #18aaa6; --s7: #9085e9; --s8: #ff8a7a;
+  --grid: rgb(255 255 255 / 0.06);
+  --grid-line: rgb(255 255 255 / 0.025); --bloom: rgb(78 230 224 / 0.11);
   --shadow: none;
 }
 
 @theme inline {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "DM Mono", ui-monospace, monospace;
+  --color-cyan: var(--cyan);
+  --radius-sm: 2px; --radius-md: 2px; --radius-lg: 2px; --radius-xl: 2px; --radius-2xl: 2px; --radius-3xl: 2px;
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
@@ -81,8 +79,8 @@ html { background: var(--bg); color: var(--text); font-family: var(--font-sans);
 body { margin: 0; overflow-x: clip; min-height: 100dvh; font-size: 15px; line-height: 1.5; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; }
 h1, h2, h3 { text-wrap: balance; letter-spacing: -0.012em; }
 .num { font-variant-numeric: tabular-nums lining-nums; font-feature-settings: "tnum" 1, "lnum" 1; }
-:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
-::selection { background: var(--accent-soft); }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+::selection { background: rgb(200 255 61 / 0.35); color: #071013; }
 button, [role="button"], a, summary, label[for], select { -webkit-tap-highlight-color: transparent; }
 button:not(:disabled), [role="button"], select { cursor: pointer; }
 dialog { color: inherit; }
@@ -96,7 +94,19 @@ dialog::backdrop { background: rgb(10 12 10 / 0.5); backdrop-filter: blur(2px); 
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  button:active:not(:disabled) { transform: none; }
 }
+
+/* the toolbox backdrop: a drafting grid with one restrained cyan bloom */
+.ambient { isolation: isolate; }
+.ambient::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; background: radial-gradient(circle at 84% 5%, var(--bloom), transparent 28rem), linear-gradient(var(--grid-line) 1px, transparent 1px), linear-gradient(90deg, var(--grid-line) 1px, transparent 1px); background-size: auto, 48px 48px, 48px 48px; }
+/* eyebrow label with the accent dash, and the mono brand mark */
+.tech-label { display: flex; align-items: center; color: var(--accent); font: 500 0.72rem/1.4 var(--font-mono); letter-spacing: 0.15em; text-transform: uppercase; }
+.tech-label::before { content: ""; flex: none; width: 2rem; height: 2px; margin-right: 0.65rem; background: currentColor; }
+.brand-mark { font-family: var(--font-mono); font-weight: 500; letter-spacing: 0.02em; }
+button:active:not(:disabled) { transform: scale(0.97); }
+::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-thumb { background-color: var(--border); } ::-webkit-scrollbar-thumb:hover { background-color: var(--cyan); }
+@media (max-width: 640px) { input, select, textarea { font-size: 16px !important; } }
 
 .recharts-surface:focus, .recharts-wrapper:focus { outline: none; }
 .recharts-text { fill: var(--muted); font-size: 11px; }

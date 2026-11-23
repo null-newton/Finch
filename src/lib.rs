@@ -12,3 +12,4 @@ pub mod secrets;
 pub mod transfers;
 pub mod mcp;
 pub mod privacy;
+pub mod web;

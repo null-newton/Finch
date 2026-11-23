@@ -118,7 +118,8 @@ function BankCard({ b, consent, canReconnect }: { b: HealthBank; consent?: Conse
 
 function ConnectDialog({ onClose, reconnect }: { onClose: () => void; reconnect?: Consent }) {
   const { t } = useTranslation("connections");
-  const [country, setCountry] = useState("FR");
+  const [country, setCountry] = useState("BE");
+  const [redirect, setRedirect] = useState("");
   const [q, setQ] = useState("");
   const [bank, setBank] = useState("");
   const [days, setDays] = useState(180);
@@ -130,6 +131,7 @@ function ConnectDialog({ onClose, reconnect }: { onClose: () => void; reconnect?
     const timer = setInterval(async () => setJob(await api.get<JobState>("/connections/auth/status")), 1500);
     return () => clearInterval(timer);
   }, [job?.state]); // eslint-disable-line react-hooks/exhaustive-deps
+  const finish = useWrite(() => api.post<JobState>("/connections/auth/finish", { url: redirect.trim() }), { invalidate: false, onSuccess: setJob });
   const qc = useQueryClient();
   useEffect(() => { if (job?.state === "done") void qc.invalidateQueries(); }, [job?.state]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
@@ -158,7 +160,8 @@ function ConnectDialog({ onClose, reconnect }: { onClose: () => void; reconnect?
             <>
               <Notice tone="info" title={t("connectDialog.loginTitle")}>{t("connectDialog.loginBody")}</Notice>
               <a href={job.url} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-accent px-4 text-sm font-medium text-accent-fg hover:bg-accent-hover"><ExternalLink className="size-4" aria-hidden /> {t("connectDialog.openLogin")}</a>
-              <Spinner label={t("connectDialog.waiting")} />
+              <Field label={t("connectDialog.pasteLabel")} hint={t("connectDialog.pasteHint")}>{(id) => <Input id={id} value={redirect} onChange={(e) => setRedirect(e.target.value)} placeholder="https://…?code=…&state=…" />}</Field>
+              <div className="flex justify-end"><Button variant="primary" busy={finish.isPending} disabled={!redirect.trim()} onClick={() => finish.mutate(undefined as never)}>{t("connectDialog.finish")}</Button></div>
             </>
           )}
           {job.state === "done" && <Notice tone="pos" title={t("connectDialog.connected")}>{t("connectDialog.connectedBody")}</Notice>}

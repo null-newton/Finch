@@ -1,7 +1,7 @@
 //! `finch`: the command line. Local output keeps raw values; only the MCP server redacts (it talks to a model).
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, profiles}, mcp, net, secrets, transfers};
+use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, profiles}, mcp, net, secrets, transfers, web};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -60,6 +60,13 @@ enum Cmd {
         #[arg(long)] force: bool },
     /// The privacy mode and the last outbound calls (egress journal)
     Privacy { #[arg(long, default_value_t = 20)] last: usize },
+    /// Serve the web app on this machine and print a one-time login link
+    Ui { #[arg(long)] host: Option<String>, #[arg(long)] port: Option<u16>, /// API only: the page comes from `pnpm dev` (port 5173)
+        #[arg(long)] dev: bool, #[arg(long)] no_browser: bool, /// print a fresh one-time login link for a running `finch ui` and exit
+        #[arg(long)] login_link: bool, /// the login (`ui_users` id) the link opens; default the owner
+        #[arg(long)] user: Option<String>, /// sign every browser out (new session key) and exit
+        #[arg(long)] rotate_session_key: bool, /// folder of the built web app (default: static/ next to the binary, then the crate's)
+        #[arg(long)] static_dir: Option<PathBuf> },
 }
 #[derive(Subcommand)] enum DbCmd { /// Apply pending migrations (a safety copy is taken first)
     Migrate { #[arg(long)] create: bool }, /// Applied and pending migrations, table counts
@@ -235,6 +242,30 @@ fn run() -> Result<()> {
             for r in &res { match r["status"].as_str() { Some("ok") => println!("  {}: pages={} new={} pending={}{}", s(&r["uid"]), s(&r["pages"]), s(&r["new"]), s(&r["pending"]), if r["replaced_imports"].as_u64().unwrap_or(0) > 0 { format!(" replaced_imports={}", s(&r["replaced_imports"])) } else { String::new() }), Some("failed") => { failed += 1; println!("  {}: FAILED - {}", s(&r["uid"]), s(&r["note"])); } _ => println!("  {}{}", if r["uid"].is_null() { String::new() } else { format!("{}: ", s(&r["uid"])) }, s(&r["note"])) } }
             if res.iter().any(|r| r["status"] == "ok" && r["new"].as_i64().unwrap_or(0) > 0) { println!("normalised {} transaction(s)", classify::normalize_all(&con, Some(&cfg.memory_dir))?); }
             if failed > 0 { anyhow::bail!("{failed} account(s) failed (the others were synced)"); } }
+        Cmd::Ui { host, port, dev, no_browser, login_link, user, rotate_session_key, static_dir } => {
+            let (host, port) = (host.unwrap_or(cfg.ui_host.clone()), port.unwrap_or(cfg.ui_port as u16));
+            if rotate_session_key { web::security::rotate_secret(&cfg.data_dir)?; println!("session key rotated: every browser session is signed out; run `finch ui` for a new login link"); return Ok(()); }
+            if user.is_some() && !login_link { bail!("--user goes with --login-link"); }
+            if let Some(u) = &user { if web::get_user(&open(true)?, u).is_none_or(|x| x.disabled) { bail!("no enabled login {u:?} (ui_users)"); } }
+            if login_link { println!("{}", web::login_url(port, dev, &web::security::LoginTokens::new(&cfg.data_dir).issue(user.as_deref())?)); eprintln!("one-time link, valid 2 minutes: open it in the browser that should get access (works with a running `finch ui`)"); return Ok(()); }
+            if !web::security::is_loopback(&host) { bail!("refusing to listen on {host:?}: the web app shows your bank data and is local only in finch"); }
+            let exe_static = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("static")));
+            let sdir = static_dir.or(exe_static.filter(|p| p.join("index.html").is_file())).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"));
+            if !dev && !sdir.join("index.html").is_file() { eprintln!("warning: the web app is not built ({}/index.html is missing): run `pnpm install && pnpm build` in web/. The API still works.", sdir.display()); }
+            open(true)?;
+            let app = std::sync::Arc::new(web::App::new(cfg.clone(), cli.insecure, port, dev, sdir, std::sync::Arc::new(|| Box::new(net::UreqHttp::new(60)) as Box<dyn net::Http>))?);
+            let _ = app.me.set(std::sync::Arc::downgrade(&app));
+            let url = web::login_url(port, dev, &app.sec.tokens.issue(None)?);
+            println!("finch web app on port {port}  (Ctrl-C to stop){}", if dev { "  [dev mode: API only, run `pnpm dev` in web/]" } else { "" });
+            println!("
+Open this one-time login link in your browser (valid 2 minutes, single use):
+
+  {url}
+
+Need another one later? Run `finch ui --login-link`.");
+            if cfg.ui_open_browser && !no_browser && !dev { let _ = open_browser(&url); }
+            web::serve(app, &host, port)?;
+        }
         Cmd::Privacy { last } => { println!("privacy mode: {}  (llm.backend {}, egress journal {})", egress::mode(&cfg), cfg.llm_backend, if cfg.privacy_egress_journal { "on" } else { "off" });
             for f in egress::FLOWS { println!("  {:<24} {}", f.0, egress::evaluate(&cfg, f.0, if f.0 == "llm.ollama" { egress::host_of(&cfg.llm_ollama_url) } else { String::new() }.as_str()).unwrap_or_else(|| "allowed".into())); }
             if let Ok(con) = open(true) { println!("last outbound calls:"); for (ts, k, h, b, p, o) in egress::journal(&con, last)? { println!("  {ts} {o:<8} {k:<22} {h:<28} {b:>7} B  {p}"); } } }

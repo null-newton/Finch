@@ -75,7 +75,7 @@ function NavList({ items, onNavigate }: { items: NavItem[]; onNavigate?: () => v
               end={it.end}
               onClick={onNavigate}
               className={({ isActive }) =>
-                cn("flex min-h-10 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors", isActive ? "bg-accent-soft text-accent" : "text-muted hover:bg-surface-2 hover:text-text")
+                cn("flex min-h-10 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors", isActive ? "bg-accent-soft text-accent ring-1 ring-accent/30" : "text-muted hover:bg-surface-2 hover:text-text")
               }
             >
               <it.icon className="size-[18px] shrink-0" aria-hidden />
@@ -93,23 +93,23 @@ function NavList({ items, onNavigate }: { items: NavItem[]; onNavigate?: () => v
 function Sidebar() {
   const { t } = useTranslation();
   return (
-    <aside className="no-print sticky top-0 hidden h-dvh w-60 shrink-0 flex-col gap-5 overflow-y-auto border-r border-border bg-surface px-3 py-4 lg:flex" aria-label={t("nav.main")}>
+    <aside className="no-print sticky top-0 hidden h-dvh w-60 shrink-0 flex-col gap-5 overflow-y-auto border-r border-border bg-bg/90 px-3 py-4 backdrop-blur-lg lg:flex" aria-label={t("nav.main")}>
       <div className="flex items-center gap-2.5 px-2 pb-1">
         <img src="/favicon.svg" alt="" className="size-7 rounded-md" />
-        <span className="text-[15px] font-semibold tracking-tight">{t("app.name")}</span>
+        <span className="brand-mark text-[15px]">{t("app.name")}</span>
       </div>
       <nav className="flex flex-col gap-4">
         <NavList items={MAIN} />
         <div>
-          <div className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("nav.section.plan")}</div>
+          <div className="mb-1 px-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.15em] text-faint">{t("nav.section.plan")}</div>
           <NavList items={PLAN} />
         </div>
         <div>
-          <div className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("nav.section.people")}</div>
+          <div className="mb-1 px-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.15em] text-faint">{t("nav.section.people")}</div>
           <NavList items={PEOPLE} />
         </div>
         <div>
-          <div className="mb-1 px-3 text-[11px] font-semibold uppercase tracking-wider text-faint">{t("nav.section.system")}</div>
+          <div className="mb-1 px-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.15em] text-faint">{t("nav.section.system")}</div>
           <NavList items={SYSTEM} />
         </div>
       </nav>
@@ -130,7 +130,7 @@ function BottomNav({ onMore }: { onMore: () => void }) {
             <NavLink to={tab.to} end={tab.end} className={({ isActive }) => cn("relative flex min-h-14 flex-col items-center justify-center gap-0.5 text-[11px] font-medium", isActive ? "text-accent" : "text-muted")}>
               <tab.icon className="size-5" aria-hidden />
               {tab.label === "nav.coach" ? t("nav.coachShort") : t(tab.label)}
-              {tab.key === "insights" && b.insights > 0 && <span className="absolute left-[55%] top-1.5 min-w-4 rounded-full bg-warn px-1 text-center text-[10px] font-semibold leading-4 text-white">{b.insights}</span>}
+              {tab.key === "insights" && b.insights > 0 && <span className="absolute left-[55%] top-1.5 min-w-4 rounded-full bg-warn px-1 text-center text-[10px] font-semibold leading-4 text-bg">{b.insights}</span>}
             </NavLink>
           </li>
         ))}
@@ -250,7 +250,7 @@ function Header() {
     <header className="no-print sticky top-0 z-20 flex min-h-14 items-center gap-2 border-b border-border bg-bg/90 px-4 backdrop-blur sm:px-6">
       <div className="flex items-center gap-2 lg:hidden">
         <img src="/favicon.svg" alt="" className="size-6 rounded-md" />
-        <span className="text-[15px] font-semibold">{t("app.name")}</span>
+        <span className="brand-mark text-[15px]">{t("app.name")}</span>
       </div>
       <div className="ml-auto flex items-center gap-1.5">
         <ScopeSwitch />
@@ -352,7 +352,7 @@ export function Layout() {
     window.scrollTo(0, 0);
   }, [loc.pathname]);
   return (
-    <div className="flex min-h-dvh">
+    <div className="ambient flex min-h-dvh">
       <a href="#main" className="sr-only z-50 rounded bg-accent px-3 py-2 text-accent-fg focus:not-sr-only focus:fixed focus:left-3 focus:top-3">
         {t("nav.skip")}
       </a>

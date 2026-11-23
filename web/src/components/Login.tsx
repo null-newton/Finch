@@ -51,7 +51,7 @@ export function Login({ onDone, reason }: { onDone: () => void; reason?: ApiErro
   }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-5 px-5 py-10">
+    <main className="ambient mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-5 px-5 py-10">
       <div className="flex items-center gap-3">
         <img src="/favicon.svg" alt="" className="size-9 rounded-lg" />
         <h1 className="text-xl font-semibold">{t("app.name")}</h1>

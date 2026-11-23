@@ -11,7 +11,7 @@ export function Card({ title, subtitle, action, children, className, pad = true,
 }) {
   const id = useId();
   return (
-    <Tag aria-labelledby={title ? id : undefined} className={cn("rounded-xl border border-border bg-surface shadow-[var(--shadow)]", className)}>
+    <Tag aria-labelledby={title ? id : undefined} className={cn("rounded-xl border border-border bg-surface/95 shadow-[var(--shadow)]", className)}>
       {(title || action) && (
         <header className="flex items-start justify-between gap-3 px-4 pt-3.5 sm:px-5">
           <div className="min-w-0">
@@ -30,12 +30,13 @@ export function Card({ title, subtitle, action, children, className, pad = true,
   );
 }
 
-export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: ReactNode; actions?: ReactNode }) {
+export function PageHeader({ title, subtitle, actions, eyebrow }: { title: string; subtitle?: ReactNode; actions?: ReactNode; eyebrow?: ReactNode }) {
   return (
-    <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-x-6 gap-y-3 border-b border-border pb-5">
       <div className="min-w-0">
-        <h1 className="text-[22px] font-semibold leading-tight sm:text-2xl">{title}</h1>
-        {subtitle && <p className="mt-1 max-w-2xl text-sm text-muted">{subtitle}</p>}
+        {eyebrow && <div className="tech-label mb-3">{eyebrow}</div>}
+        <h1 className="break-words text-[26px] font-extrabold leading-tight tracking-tight sm:text-3xl">{title}</h1>
+        {subtitle && <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">{subtitle}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
@@ -75,7 +76,7 @@ const TONES: Record<Tone, string> = {
 };
 export function Badge({ tone = "neutral", children, className, title }: { tone?: Tone; children: ReactNode; className?: string; title?: string }) {
   return (
-    <span title={title} className={cn("inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium leading-4", TONES[tone], className)}>
+    <span title={title} className={cn("inline-flex items-center gap-1 whitespace-nowrap rounded px-2 py-0.5 font-mono text-[11px] font-medium leading-4", TONES[tone], className)}>
       {children}
     </span>
   );
@@ -104,10 +105,10 @@ export function Notice({ tone = "info", children, className, title }: { tone?: "
 type BtnProps = ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger"; size?: "sm" | "md"; busy?: boolean };
 export const Button = forwardRef<HTMLButtonElement, BtnProps>(function Button({ variant = "secondary", size = "md", busy, className, children, disabled, ...p }, ref) {
   const v = {
-    primary: "bg-accent text-accent-fg hover:bg-accent-hover border-transparent",
+    primary: "bg-accent text-accent-fg hover:bg-accent-hover border-accent font-semibold",
     secondary: "bg-surface text-text border-border-strong hover:bg-surface-2",
     ghost: "bg-transparent text-muted border-transparent hover:bg-surface-2 hover:text-text",
-    danger: "bg-neg text-white border-transparent hover:opacity-90",
+    danger: "bg-neg text-bg border-transparent hover:opacity-90",
   }[variant];
   return (
     <button

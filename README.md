@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 3)
+## Status (phase 4)
 
 | Area | State |
 |---|---|
@@ -27,10 +27,12 @@ Python app, so both can work on the same data while the port is in progress.
 | CODA closing balance stored as the account balance (the forecast's starting point for file-imported accounts) | new (phase 2) |
 | Privacy: pseudonyms, hashed refs, household scrubber, merchant generalisation, fail-closed guard, injection scan | ported |
 | MCP server `finance` (stdio): `coverage`, `cashflow`, `category_averages`, `transactions_search`, `recurring`, `price_changes`, `anomalies`, `forecast`, `budget_status`, `budget_suggestions`, `calendar`, `goals` | ported |
-| Web app (`web/`) | copied unchanged; the Rust HTTP API that serves it is phase 2 |
+| Web API `finch ui` (loopback only): one-time login link (token in the URL fragment), signed HttpOnly SameSite=Strict cookie, CSRF, Host / Origin / `Sec-Fetch-Site` checks, rate limits, strict headers (CSP), revocable sessions, per-person logins with a deny-by-default child scope, audit log; serves `static/` | ported (phase 4) |
+| Web endpoints: session, taxonomy, filters, health, balances, cash flow, averages, month categories, forecast, categories (drill-down), calendar (+ `.ics`), budgets, goals, subscriptions, insights (dismiss), transactions (filters, totals, CSV export, detail, category fix, override), transfers (link / unlink), connections, account edit, sync and connect jobs, banks, review queue | ported (phase 4); the rest answers 404 `not_ported` |
+| Web app (`web/`) | restyled with the toolbox look (Manrope / DM Mono, ink-teal and lime, drafting grid); pages and interactions unchanged; the bank connection asks you to paste the redirect address |
 
-Not ported yet: the web API (phase 4); memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth,
-rental property, alerts, household attribution, year review, quality / eval, backups and export (phase 5). Until then, use the Python app for
+Not ported yet (phase 5): per-person views (`?member=`), previews (`dry_run`) and memory annotations in the web app; memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth,
+rental property, alerts, household attribution, year review, quality / eval, backups and export. Until then, use the Python app for
 them on the same database. Budgets and goals are read from `memory/`; writing them stays a memory proposal.
 
 ## Belgian banks
@@ -95,6 +97,9 @@ finch classify review            # held-back (possible people) and low-confidenc
 finch classify correct "SHOP KEY" food.groceries
 finch privacy                    # the privacy mode and the last outbound calls
 finch mcp serve
+(cd web && pnpm install && pnpm build)   # builds the page into static/
+finch ui                         # http://127.0.0.1:8765, prints a one-time login link (valid 2 minutes)
+finch ui --login-link            # a fresh link for a running server; --rotate-session-key signs every browser out
 ```
 
 `--dry-run` shows what an import would write. `--json` prints the raw result of `coverage`, `cashflow` and `averages`.
