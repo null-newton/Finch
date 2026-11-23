@@ -2,11 +2,8 @@
 //! two-decimal STRING in every JSON result (never a float); ratios are floats rounded to 4 decimals.
 //! Rules applied once for everybody: excluded / needs-review accounts are out; only EUR transactions are analysed (others are
 //! counted in `foreign`); spending = every category except `transfer.*` and `income.*`; refunds lower spending.
-pub mod anomalies;
 pub mod averages;
 pub mod cashflow;
-pub mod planning;
-pub mod recurring;
 
 use crate::{classify::rules::{categorised, Rules}, config::Config, memory, util::*};
 use anyhow::{bail, Result};
@@ -24,43 +21,34 @@ pub fn is_income(c: &str) -> bool { c.starts_with("income.") && c != "income.ref
 pub fn is_spending(c: &str) -> bool { !c.starts_with("transfer.") && !c.starts_with("income.") }
 
 // ---------------------------------------------------------------- settings ([analytics] of config.toml)
-macro_rules! settings {
-    ($($name:ident : $t:ident = $def:expr),* $(,)?) => {
-        /// Tunable thresholds of the analytics engine; config.toml only overrides the defaults.
-        #[derive(Debug, Clone)] pub struct Settings { $(pub $name: settings!(@ty $t)),* }
-        impl Default for Settings { fn default() -> Self { Self { $($name: settings!(@def $t $def)),* } } }
-        impl Settings {
-            pub fn from_table(t: &toml::Table) -> Result<Self> {
-                let mut s = Self::default();
-                for (k, v) in t { match k.as_str() { $(stringify!($name) => s.$name = settings!(@get $t k v),)* _ => bail!("unknown [analytics] setting(s): {k}") } }
-                if !(0.0 < s.recurring_amount_tolerance && s.recurring_amount_tolerance < 1.0) { bail!("[analytics] recurring_amount_tolerance must be between 0 and 1 (0.15 = +-15 %)"); }
-                if s.recurring_min_occurrences < 2 || s.average_window_months < 1 { bail!("[analytics] recurring_min_occurrences must be >= 2 and average_window_months >= 1"); }
-                Ok(s)
+const KNOWN: [&str; 38] = ["average_window_months", "average_min_months", "coverage_min_share", "lumpy_categories", "lumpy_min_months", "household_mismatch_pct", "recurring_amount_tolerance", "recurring_min_occurrences",
+    "recurring_loose_amount_categories", "recurring_discretionary_groups", "recurring_discretionary_min_occurrences", "recurring_yearly_pair_groups", "recurring_ended_factor", "recurring_variable_categories",
+    "price_change_threshold_pct", "price_change_min_abs", "price_change_income_pct", "price_change_variable_pct", "anomaly_min_history_months", "anomaly_z", "anomaly_min_excess", "anomaly_min_ratio",
+    "anomaly_duplicate_days", "anomaly_duplicate_min_amount", "anomaly_new_merchant_days", "anomaly_new_merchant_min", "anomaly_large_tx_min", "anomaly_large_tx_iqr_factor", "anomaly_lookback_days", "anomaly_months",
+    "forecast_band_z", "forecast_variable_months", "forecast_balance_stale_days", "budget_suggest_months", "calendar_days", "asset_stale_months", "loan_grace_days", "loan_reminder_months"];
+const KNOWN2: [&str; 3] = ["rental_reminder_months", "rental_rent_grace_days", "rental_rate_gap_pts"];
+
+#[derive(Debug, Clone)]
+pub struct Settings { pub average_window_months: usize, pub average_min_months: usize, pub coverage_min_share: f64, pub lumpy_categories: Vec<String>, pub lumpy_min_months: usize, pub household_mismatch_pct: f64 }
+impl Default for Settings { fn default() -> Self { Self { average_window_months: 12, average_min_months: 3, coverage_min_share: 0.10, lumpy_categories: vec!["travel.".into(), "housing.renovation".into(), "taxes.".into()], lumpy_min_months: 12, household_mismatch_pct: 0.10 } } }
+impl Settings {
+    pub fn from_table(t: &toml::Table) -> Result<Self> {
+        let mut s = Self::default();
+        for (k, v) in t {
+            if !KNOWN.contains(&k.as_str()) && !KNOWN2.contains(&k.as_str()) { bail!("unknown [analytics] setting(s): {k}"); }
+            let n = || -> Result<f64> { match v { toml::Value::Integer(i) if *i >= 0 => Ok(*i as f64), toml::Value::Float(f) if *f >= 0.0 => Ok(*f), _ => bail!("[analytics] {k} must be a number >= 0, got {v}") } };
+            let u = || -> Result<usize> { match v { toml::Value::Integer(i) if *i >= 0 => Ok(*i as usize), _ => bail!("[analytics] {k} must be a whole number >= 0, got {v}") } };
+            match k.as_str() {
+                "average_window_months" => s.average_window_months = u()?, "average_min_months" => s.average_min_months = u()?, "lumpy_min_months" => s.lumpy_min_months = u()?,
+                "coverage_min_share" => s.coverage_min_share = n()?, "household_mismatch_pct" => s.household_mismatch_pct = n()?,
+                "lumpy_categories" => s.lumpy_categories = v.as_array().filter(|a| a.iter().all(|x| x.is_str())).ok_or_else(|| anyhow::anyhow!("[analytics] {k} must be a list of strings"))?.iter().map(|x| x.as_str().unwrap().into()).collect(),
+                _ => { if v.is_array() { continue; } n()?; }
             }
         }
-    };
-    (@ty u) => { usize }; (@ty f) => { f64 }; (@ty l) => { Vec<String> };
-    (@def l $d:expr) => { $d.iter().map(|x: &&str| x.to_string()).collect() }; (@def $t:ident $d:expr) => { $d };
-    (@get u $k:ident $v:ident) => { match $v { toml::Value::Integer(i) if *i >= 0 => *i as usize, _ => bail!("[analytics] {} must be a whole number >= 0, got {}", $k, $v) } };
-    (@get f $k:ident $v:ident) => { match $v { toml::Value::Integer(i) if *i >= 0 => *i as f64, toml::Value::Float(x) if *x >= 0.0 => *x, _ => bail!("[analytics] {} must be a number >= 0, got {}", $k, $v) } };
-    (@get l $k:ident $v:ident) => { match $v.as_array() { Some(a) if a.iter().all(|x| x.is_str()) => a.iter().map(|x| x.as_str().unwrap().to_string()).collect(), _ => bail!("[analytics] {} must be a list of strings", $k) } };
+        if s.average_window_months < 1 { bail!("[analytics] average_window_months must be >= 1"); }
+        Ok(s)
+    }
 }
-settings! {
-    average_window_months: u = 12, average_min_months: u = 3, coverage_min_share: f = 0.10, lumpy_categories: l = ["travel.", "housing.renovation", "taxes."], lumpy_min_months: u = 12, household_mismatch_pct: f = 0.10,
-    recurring_amount_tolerance: f = 0.15, recurring_min_occurrences: u = 3,
-    recurring_loose_amount_categories: l = ["housing.rental_property_loan", "housing.mortgage", "housing.property_charges", "debt.", "insurance."],
-    recurring_discretionary_groups: l = ["food", "shopping", "leisure", "travel", "personal_care", "cash", "transport.fuel", "transport.parking_tolls", "transport.taxi_rideshare"],
-    recurring_discretionary_min_occurrences: u = 5,
-    recurring_yearly_pair_groups: l = ["subscriptions", "insurance", "housing", "taxes", "fees", "health", "education", "charity", "debt", "income"],
-    recurring_ended_factor: f = 1.5,
-    recurring_variable_categories: l = ["housing.energy", "housing.water", "subscriptions.telecom", "housing.property_charges", "health.health_insurance", "taxes.taxes"],
-    price_change_threshold_pct: f = 3.0, price_change_min_abs: f = 0.50, price_change_income_pct: f = 5.0, price_change_variable_pct: f = 20.0,
-    anomaly_min_history_months: u = 6, anomaly_z: f = 3.5, anomaly_min_excess: f = 50.0, anomaly_min_ratio: f = 1.5, anomaly_duplicate_days: u = 3, anomaly_duplicate_min_amount: f = 10.0,
-    anomaly_new_merchant_days: u = 60, anomaly_new_merchant_min: f = 150.0, anomaly_large_tx_min: f = 100.0, anomaly_large_tx_iqr_factor: f = 3.0, anomaly_lookback_days: u = 90, anomaly_months: u = 3,
-    forecast_band_z: f = 1.28, forecast_variable_months: u = 6, forecast_balance_stale_days: u = 3, budget_suggest_months: u = 6, calendar_days: u = 60, asset_stale_months: u = 3,
-    loan_grace_days: u = 5, loan_reminder_months: u = 6, rental_reminder_months: u = 12, rental_rent_grace_days: u = 7, rental_rate_gap_pts: f = 0.5,
-}
-pub fn in_list(cat: &str, names: &[String]) -> bool { names.iter().any(|n| cat == n || (n.ends_with('.') && cat.starts_with(n.as_str()))) }
 
 // ---------------------------------------------------------------- dataset
 #[derive(Debug, Clone)]
@@ -121,22 +109,12 @@ impl Coverage {
 }
 pub fn last_n(m: &[String], n: usize) -> Vec<String> { if n > 0 && m.len() > n { m[m.len() - n..].to_vec() } else { m.to_vec() } }
 
-#[derive(Debug, Clone)]
-pub struct Balance { pub account: String, pub amount_c: i64, pub ty: String, pub fetched_at: String, pub as_of: NaiveDate }
-pub const BALANCE_PREFERENCE: [&str; 8] = ["CLBD", "ITBD", "XPCD", "CLAV", "ITAV", "OPBD", "OPAV", "FWAV"];
-pub struct Dataset { pub today: NaiveDate, pub settings: Settings, pub accounts: BTreeMap<String, AccountInfo>, pub txs: Vec<Tx>, pub coverage: Coverage, pub foreign: Vec<String>, pub memory_warnings: Vec<String>,
-    /// tx_key -> (creditor id, mandate ref) from the parsers
-    pub parse_meta: HashMap<String, (Option<String>, Option<String>)>,
-    /// stored recurring series id -> its tx keys (id continuity)
-    pub stored_members: BTreeMap<String, BTreeSet<String>>,
-    /// uid -> latest balance of the most "booked" type
-    pub balances: BTreeMap<String, Balance>, pub memory_dir: std::path::PathBuf }
+pub struct Dataset { pub today: NaiveDate, pub settings: Settings, pub accounts: BTreeMap<String, AccountInfo>, pub txs: Vec<Tx>, pub coverage: Coverage, pub foreign: Vec<String>, pub memory_warnings: Vec<String> }
 
 impl Dataset {
     pub fn load(con: &Connection, cfg: &Config, today: Option<NaiveDate>) -> Result<Self> {
         let rules = Rules::load(cfg)?; let (ann, warn) = memory::load_annotations(&cfg.memory_dir);
-        let mut ds = Self::load_with(con, &rules, &ann, today.unwrap_or_else(|| chrono::Local::now().date_naive()), Settings::from_table(&cfg.analytics)?, warn.into_iter().collect())?;
-        ds.memory_dir = cfg.memory_dir.clone(); Ok(ds)
+        Self::load_with(con, &rules, &ann, today.unwrap_or_else(|| chrono::Local::now().date_naive()), Settings::from_table(&cfg.analytics)?, warn.into_iter().collect())
     }
     pub fn load_with(con: &Connection, rules: &Rules, ann: &[memory::Annotation], today: NaiveDate, settings: Settings, memory_warnings: Vec<String>) -> Result<Self> {
         let accounts: BTreeMap<String, AccountInfo> = con.prepare("SELECT uid, COALESCE(NULLIF(label,''), NULLIF(name,''), uid), bank, owner, purpose, currency FROM accounts WHERE exclude=0 AND needs_review=0 ORDER BY uid")?
@@ -159,17 +137,7 @@ impl Dataset {
             let (u, ts) = r?; if let Some(x) = ts.as_deref().and_then(d) { if accounts.contains_key(&u) { last_sync.insert(u, x); } }
         }
         let coverage = Coverage::new(&accounts, &stats, &last_sync, today);
-        let parse_meta = con.prepare("SELECT tx_key, creditor_id, mandate_ref FROM tx_parse_meta WHERE creditor_id IS NOT NULL OR mandate_ref IS NOT NULL")?.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?.collect::<rusqlite::Result<_>>()?;
-        let mut stored_members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for r in con.prepare("SELECT series_id, tx_key FROM recurring_members")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? { let (s, k) = r?; stored_members.entry(s).or_default().insert(k); }
-        let mut latest: BTreeMap<String, BTreeMap<String, (String, i64)>> = BTreeMap::new();
-        for r in con.prepare("SELECT account_uid, fetched_at, balance_type, amount, currency FROM balances ORDER BY fetched_at, rowid")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, Option<String>>(4)?)))? {
-            let (u, f, t, a, c) = r?; let Some(a) = a else { continue };
-            if !accounts.contains_key(&u) || !matches!(c.as_deref(), None | Some("") | Some("EUR")) || d(&f).is_none_or(|x| x > today) { continue; }
-            latest.entry(u).or_default().insert(t.unwrap_or_else(|| "?".into()), (f, to_cents(a)));
-        }
-        let balances = latest.into_iter().map(|(u, by)| { let t = BALANCE_PREFERENCE.iter().find(|t| by.contains_key(**t)).map(|t| t.to_string()).unwrap_or_else(|| by.keys().next().unwrap().clone()); let (f, c) = by[&t].clone(); (u.clone(), Balance { account: u, amount_c: c, ty: t, as_of: d(&f).unwrap(), fetched_at: f }) }).collect();
-        Ok(Self { today, settings, accounts, txs, coverage, foreign: foreign.into_iter().collect(), memory_warnings, parse_meta, stored_members, balances, memory_dir: std::path::PathBuf::new() })
+        Ok(Self { today, settings, accounts, txs, coverage, foreign: foreign.into_iter().collect(), memory_warnings })
     }
     pub fn accounts_in(&self, s: &Scope) -> Vec<&AccountInfo> { self.accounts.values().filter(|a| s.accepts(a)).collect() }
     pub fn uids_in(&self, s: &Scope) -> Vec<String> { self.accounts_in(s).into_iter().map(|a| a.uid.clone()).collect() }

@@ -1,7 +1,7 @@
 //! The `finance` MCP server (stdio, JSON-RPC 2.0, newline-delimited): read-only tools over the household's REDACTED data.
 //! THE choke point is [`Session::publish`]: every output (success or error) is scanned for injected instructions, wrapped,
 //! size-capped and privacy-asserted; any hit replaces the whole output with a generic refusal (nothing echoed).
-use crate::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, config::Config, db, privacy::{scan_all, wrap_untrusted, Guard, Redactor}, util::*};
+use crate::{analytics::{self, averages::category_averages, cashflow::cashflow, Dataset, Scope}, config::Config, db, privacy::{scan_all, wrap_untrusted, Guard, Redactor}, util::*};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
@@ -14,7 +14,6 @@ const GENERIC_REFUSAL: &str = "refused; details withheld by the privacy filter -
 
 pub struct Tool { pub name: &'static str, pub description: String, pub schema: Value }
 fn scope_props() -> Value { json!({"account": {"type": "string", "maxLength": 60, "description": "account pseudonym from a tool result (account-main-1)"}, "owner": {"type": "string", "maxLength": 40, "description": "owner pseudonym (joint, adult-1, kid-1)"}, "purpose": {"type": "string", "maxLength": 20}}) }
-fn plain(props: Value) -> Value { json!({"type": "object", "properties": props, "additionalProperties": false}) }
 fn obj(extra: Value, required: &[&str]) -> Value { let mut p = scope_props(); if let (Some(p), Some(e)) = (p.as_object_mut(), extra.as_object()) { p.extend(e.clone()); } json!({"type": "object", "properties": p, "required": required, "additionalProperties": false}) }
 pub fn tools() -> Vec<Tool> {
     let month = json!({"type": "string", "pattern": r"^\d{4}-(0[1-9]|1[0-2])$", "description": "YYYY-MM"}); let date = json!({"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$", "description": "YYYY-MM-DD"});
@@ -25,14 +24,6 @@ pub fn tools() -> Vec<Tool> {
         Tool { name: "transactions_search", description: format!("Search transactions (REDACTED view): date, signed amount, category, account / owner pseudonyms, generalised merchant name and a hashed `ref`. Filtered totals are computed for you. Paginated (`limit` <= 50, `cursor`). Do not sum amounts yourself - use `total`.{DATA_NOTE}"),
             schema: obj(json!({"date_from": date, "date_to": date, "category": {"type": "string", "maxLength": 80}, "direction": {"type": "string", "enum": ["in", "out"]}, "min_amount": {"type": "number", "minimum": 0}, "max_amount": {"type": "number", "minimum": 0},
                 "merchant_contains": {"type": "string", "maxLength": 60}, "tag": {"type": "string", "maxLength": 40}, "sort": {"type": "string", "enum": ["date_desc", "amount_desc", "amount_asc"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "cursor": {"type": "integer", "minimum": 0}}), &[]) },
-        Tool { name: "recurring", description: format!("Detected recurring payments and income (subscriptions, bills, loans, salary): cadence, expected amount, yearly cost, next expected date, `rec_` series ids.{DATA_NOTE}"), schema: obj(json!({"include_ended": {"type": "boolean"}}), &[]) },
-        Tool { name: "price_changes", description: format!("Recurring payments whose price changed (old / new amount, yearly impact, `chg_` ids).{DATA_NOTE}"), schema: obj(json!({"since": date, "only_confirmed": {"type": "boolean"}}), &[]) },
-        Tool { name: "anomalies", description: format!("Unusual spending found by the analytics: category spikes, duplicate charges, new merchants, large payments (`anm_` ids with transaction evidence refs).{DATA_NOTE}"), schema: obj(json!({}), &[]) },
-        Tool { name: "forecast", description: format!("Cash-flow forecast of the balances for the next `days` days with a band, at-risk dates and flags.{DATA_NOTE}"), schema: obj(json!({"days": {"type": "integer", "minimum": 7, "maximum": 365}, "points": {"type": "boolean", "description": "include the daily points (large)"}}), &[]) },
-        Tool { name: "budget_status", description: format!("Progress of every budget this month: spent, remaining, projected end of month, over / at risk.{DATA_NOTE}"), schema: plain(json!({"as_of": date})) },
-        Tool { name: "budget_suggestions", description: format!("Suggested budgets per category computed from recent months (proposals only; nothing is set).{DATA_NOTE}"), schema: obj(json!({"months": {"type": "integer", "minimum": 1, "maximum": 24}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}), &[]) },
-        Tool { name: "calendar", description: format!("Upcoming payments in the next `days` days: recurring payments, contract dates and notice deadlines, consents, asset reminders.{DATA_NOTE}"), schema: plain(json!({"days": {"type": "integer", "minimum": 1, "maximum": 120}, "include_transfers": {"type": "boolean"}})) },
-        Tool { name: "goals", description: format!("Savings goals and their progress.{DATA_NOTE}"), schema: plain(json!({})) },
     ]
 }
 
@@ -73,21 +64,9 @@ impl Session {
     fn run(&mut self, name: &str, a: &Value) -> Result<Value, String> {
         let spec = tools().into_iter().find(|t| t.name == name).ok_or_else(|| format!("unknown tool {name:?}"))?;
         validate(&spec.schema, a).map_err(|e| format!("invalid arguments: {e}"))?;
-        let scoped = spec.schema["properties"].get("account").is_some();
-        let scope = if scoped { self.scope(a)? } else { Scope::default() };
-        self.data().map_err(|e| format!("{name} failed (data not available: {})", e.root_cause()))?;
-        let (ds, red, _) = self.data.as_ref().unwrap(); let con = &self.con;
-        let date = |k: &str| a[k].as_str().map(|v| crate::util::d(v).ok_or(format!("{v:?} is not a date (YYYY-MM-DD)"))).transpose();
-        let fail = |e: anyhow::Error| format!("{name} failed ({})", e.root_cause());
+        let scope = if name == "coverage" { Scope::default() } else { self.scope(a)? };
+        let (ds, red, _) = self.data().map_err(|e| format!("{name} failed (data not available: {})", e.root_cause()))?;
         let raw = match name {
-            "recurring" => recurring::detect(ds, &scope, a["include_ended"].as_bool().unwrap_or(true)).json,
-            "price_changes" => { let rec = recurring::detect(ds, &scope, true); let dis = string_set(con, "SELECT id FROM price_change_dismissals").map_err(fail)?; recurring::price_changes(ds, &rec, date("since")?, a["only_confirmed"].as_bool().unwrap_or(false), &dis, false) }
-            "anomalies" => { let rec = recurring::detect(ds, &scope, true); anomalies::detect(ds, &scope, &rec, &anomalies::dismissed_ids(con).map_err(fail)?, false) }
-            "forecast" => { let rec = recurring::detect(ds, &Scope::default(), true); planning::forecast(ds, &rec, &scope, a["days"].as_i64().unwrap_or(90), a["points"].as_bool().unwrap_or(false)) }
-            "budget_status" => { let rec = recurring::detect(ds, &Scope::default(), true); planning::status(ds, &rec, date("as_of")?) }
-            "budget_suggestions" => planning::suggest(ds, &scope, a["months"].as_u64().map(|x| x as usize), a["limit"].as_u64().map(|x| x as usize)),
-            "calendar" => { let rec = recurring::detect(ds, &Scope::default(), true); planning::calendar(ds, con, &rec, a["days"].as_u64().map(|x| x as usize), a["include_transfers"].as_bool().unwrap_or(false)) }
-            "goals" => planning::goals(ds),
             "coverage" => analytics::coverage(ds),
             "category_averages" => category_averages(ds, &scope, a["window"].as_u64().map(|x| x as usize)),
             "cashflow" => cashflow(ds, &scope, a["months"].as_u64().unwrap_or(6) as usize, a["end_month"].as_str(), a["include_current"].as_bool().unwrap_or(false), a["breakdown"].as_bool().unwrap_or(true)),
@@ -140,8 +119,6 @@ impl Session {
         let text = serde_json::to_string(&data).unwrap(); Output { ok, data, text }
     }
 }
-
-fn string_set(con: &Connection, sql: &str) -> Result<std::collections::HashSet<String>> { Ok(con.prepare(sql)?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?) }
 
 fn search(ds: &Dataset, red: &Redactor, scope: &Scope, a: &Value) -> Result<Value, String> {
     let date = |k: &str| a[k].as_str().map(|s| d(s).ok_or(format!("{s:?} is not a date (YYYY-MM-DD)"))).transpose();

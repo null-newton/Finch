@@ -7,6 +7,5 @@ pub mod db;
 pub mod ingest;
 pub mod memory;
 pub mod secrets;
-pub mod transfers;
 pub mod mcp;
 pub mod privacy;

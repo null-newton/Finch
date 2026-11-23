@@ -27,8 +27,6 @@ const MANDATE: &str = r"(?i)\b(?:REFERENTIE\s+MANDAAT|MANDAAT(?:\s*(?:NUMMER|REF
 const OP_DATE: &str = r"(?i)\b(?:DATUM|DATE|OP|LE)\s*:?\s*(\d{2})[/.-](\d{2})[/.-](\d{2,4})\b";
 const OWN_ACCOUNT_WORDS: &str = r"(?i)\b(?:SPAARREKENING|SPAARBOEKJE|ZICHTREKENING|TERMIJNREKENING|EIGEN\s+REKENING|COMPTE\s+D'?EPARGNE|COMPTE\s+A\s+VUE|PROPRE\s+COMPTE|SAVINGS\s+ACCOUNT)\b";
 
-/// "IBAN QXKT": four letters from a hash of the normalised IBAN (merchant keys drop digits, and the number must not travel).
-pub fn iban_tag(iban: &str) -> String { let h = sha1_hex(&iban.split_whitespace().collect::<String>().to_uppercase()); format!("IBAN {}", h.bytes().take(4).map(|b| (b'A' + b % 26) as char).collect::<String>()) }
 pub fn structured_ref(text: &str) -> Option<String> { cap(re!(STRUCT_COMM), text).map(|c| format!("+++{}/{}/{}+++", g(&c, 1), g(&c, 2), g(&c, 3))) }
 fn op_date(text: &str) -> Option<String> {
     let c = cap(re!(OP_DATE), text)?; let y = g(&c, 3); let y: i32 = if y.len() == 2 { 2000 + y.parse::<i32>().ok()? } else { y.parse().ok()? };
@@ -79,8 +77,6 @@ fn parse_inner(tx: &RawTx, h: &Household, segs: &[String], desc: &str, head: &st
     if let Some(c) = cap(re!(TRANSFER), head) {
         let mut who = clean_name(gn(&c, "who"));
         if who.is_empty() { if let Some(n) = segs.iter().skip(1).map(|s| clean_name(s)).find(|s| !s.is_empty()) { who = n; } }
-        // only an IBAN names the other side: a stable letters-only tag of it (never the number) so the payments still group
-        if who.is_empty() { if let Some(m) = find(re!(IBAN_ANY), desc) { who = iban_tag(&desc[m.0..m.1]); } }
         let wero = gn(&c, "k").to_uppercase().contains("WERO");
         let ty = if is(re!(OWN_ACCOUNT_WORDS), desc) { "internal_transfer" } else { classify_transfer(&who, amount, h, wero, true, Some(&tx.bank)) };
         return with_cp(result(ty, &who, None, None), (!who.is_empty()).then(|| who.clone()));
@@ -101,8 +97,6 @@ mod tests {
         let r = p("EUROPESE OVERSCHRIJVING NAAR BE68 5390 0754 7034 PEETERS MARIE MEDEDELING : verjaardag", -50.0); assert_eq!((r.tx_type.as_str(), r.merchant_raw.as_str()), ("person_transfer_out", "PEETERS MARIE"));
         let r = p("OVERSCHRIJVING VAN ACME BV +++123/4567/89012+++", 2500.0); assert_eq!(r.tx_type, "transfer_in"); assert_eq!(r.merchant_raw, "ACME BV"); assert_eq!(r.reference.as_deref(), Some("+++123/4567/89012+++"));
         let r = p("OVERSCHRIJVING NAAR SPAARREKENING BE12 3456 7890 1234", -200.0); assert_eq!(r.tx_type, "internal_transfer");
-        let a = p("OVERSCHRIJVING VAN BE68 5390 0754 7034", 50.0); let b = p("OVERSCHRIJVING VAN BE68539007547034", 60.0);
-        assert!(a.merchant_key.starts_with("IBAN ") && a.merchant_key == b.merchant_key && !a.merchant_key.chars().any(|c| c.is_ascii_digit()), "{}", a.merchant_key);
         let r = p("VIREMENT EUROPEEN EN FAVEUR DE JAN DE SMET", -20.0); assert_eq!(r.tx_type, "person_transfer_out");
     }
     #[test] fn others() {

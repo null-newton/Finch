@@ -7,7 +7,7 @@ result, and every tool result is redacted and privacy-checked before it leaves t
 finch reads the **same database schema, `config.toml`, `memory/` folder and `COACH_*` environment variables** as the
 Python app, so both can work on the same data while the port is in progress.
 
-## Status (phase 2)
+## Status (phase 1)
 
 | Area | State |
 |---|---|
@@ -17,19 +17,15 @@ Python app, so both can work on the same data while the port is in progress.
 | File imports: CSV (profiles or an inline mapping), OFX/QFX, CAMT.053, **CODA**; multiset dedup, re-import adds nothing | ported |
 | Descriptor parsing: **Belgian banks** (NL / FR / EN), Revolut | new (replaces the French / Italian parsers) |
 | Categories: override, transfer link, type rules, user labels, Belgian merchant rules, entities, LLM labels, memory annotations, splits | ported (reads LLM labels, does not create them yet) |
-| Analytics: coverage model, cash flow, category averages | ported (phase 1) |
-| Internal-transfer matching: auto-link (opt-in), proposals, ambiguous pairs, manual link / unlink, cross-bank window, member evidence | ported (phase 2) |
-| Recurring series (stored, stable ids), price changes, anomalies (spikes, duplicates, new merchants, large payments; dismissable) | ported (phase 2) |
-| Budgets (status, rollover, suggestions), goals, cash-flow forecast with band, upcoming-payments calendar | ported (phase 2); loan schedules and Belgian notice rules come with the loans / contracts phase |
-| CODA closing balance stored as the account balance (the forecast's starting point for file-imported accounts) | new (phase 2) |
+| Analytics: coverage model, cash flow, category averages | ported |
 | Privacy: pseudonyms, hashed refs, household scrubber, merchant generalisation, fail-closed guard, injection scan | ported |
-| MCP server `finance` (stdio): `coverage`, `cashflow`, `category_averages`, `transactions_search`, `recurring`, `price_changes`, `anomalies`, `forecast`, `budget_status`, `budget_suggestions`, `calendar`, `goals` | ported |
+| MCP server `finance` (stdio): `coverage`, `cashflow`, `category_averages`, `transactions_search` | ported |
 | Web app (`web/`) | copied unchanged; the Rust HTTP API that serves it is phase 2 |
 
-Not ported yet: LLM / kNN classification and review, Enable Banking sync (consent, JWT auth, callback) (phase 3); the web API
-(phase 4); memory proposals and questions, the coach runtime, subscriptions and contracts, loans and net worth, rental property,
-alerts, household attribution, year review, quality / eval, backups and export (phase 5). Until then, use the Python app for them
-on the same database. Budgets and goals are read from `memory/`; writing them stays a memory proposal.
+Not ported yet (phase 2 and later): Enable Banking sync (consent, JWT auth, callback), LLM / kNN classification and review,
+internal-transfer matching, recurring payments, price changes, anomalies, forecast, budgets and goals, memory proposals and
+questions, the coach runtime, subscriptions and contracts, loans and net worth, rental property, alerts, household attribution,
+quality / eval, backups and export, the web API. Until then, use the Python app for them on the same database.
 
 ## Belgian banks
 
@@ -79,13 +75,6 @@ finch accounts set imp-zichtrekening --owner joint --purpose main
 finch coverage
 finch cashflow --months 6
 finch averages
-finch transfers match            # proposals; --link stores the confident ones
-finch recurring                  # --refresh stores the series
-finch anomalies                  # --refresh, --dismiss anm_...
-finch forecast --days 60
-finch budgets status
-finch calendar
-finch refresh                    # the daily analytics step
 finch mcp serve
 ```
 
