@@ -109,7 +109,11 @@ impl Store {
             "assets.yaml" => for it in items { let a: crate::loans::Asset = typed(rel, key, it)?; let w = format!("asset {}", a.id);
                 if !ASSET_KINDS.contains(&a.kind.as_str()) { bail!("{rel}: {w}: kind must be one of {}", ASSET_KINDS.join(", ")); }
                 for x in [a.balance, a.value, a.purchase_price, a.contribution_monthly, a.rent_monthly].into_iter().flatten() { if !x.is_finite() { bail!("{rel}: {w}: amounts must be numbers"); } }
-                date(&a.as_of, &w)?; date(&a.purchase_date, &w)?; if let Some(l) = &a.lease { date(&l.start_date, &w)?; if l.base_index.is_some_and(|x| x <= 0.0) { bail!("{rel}: {w}: lease.base_index must be positive"); } } },
+                date(&a.as_of, &w)?; date(&a.purchase_date, &w)?; if let Some(l) = &a.lease { date(&l.start_date, &w)?; if l.base_index.is_some_and(|x| x <= 0.0) { bail!("{rel}: {w}: lease.base_index must be positive"); } }
+                for v in &a.vacancies { date(&Some(v.start.clone()), &w)?; date(&v.end, &w)?; if v.end.as_ref().is_some_and(|e| *e < v.start) { bail!("{rel}: {w}: a vacancy ends before it starts"); } }
+                if let Some(m) = a.market_rate.as_ref().map(jsonify) { if !m["rate_pct"].as_f64().is_some_and(|x| (0.0..=25.0).contains(&x)) { bail!("{rel}: {w}: market_rate.rate_pct must be a percentage between 0 and 25"); } date(&m["as_of"].as_str().map(String::from), &w)?; }
+                if let Some(c) = a.commitment.as_ref().map(jsonify) { if !c.is_object() { bail!("{rel}: {w}: commitment must be a mapping"); } for k in ["start_date", "end_date"] { date(&c[k].as_str().map(String::from), &w)?; }
+                    let e = &c["extension"]; if !e.is_null() && !e["decision"].as_str().is_some_and(|x| ["undecided", "extend", "not_extend"].contains(&x)) { bail!("{rel}: {w}: commitment.extension.decision must be undecided, extend or not_extend"); } date(&e["decided_on"].as_str().map(String::from), &w)?; } },
             "events.yaml" => for it in items { let e: VEvent = typed(rel, key, it)?; date(&e.start, &format!("event {}", e.id))?; date(&e.end, &format!("event {}", e.id))?; },
             "household.yaml" => {
                 let members: Vec<crate::household::Member> = items.iter().map(|it| typed(rel, key, it)).collect::<Result<_>>()?;

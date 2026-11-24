@@ -120,3 +120,110 @@ fn endpoints() {
     assert_eq!(n, 2, "who changed what is audited (never a payload)");
     let _ = web::API;
 }
+
+#[test]
+fn insight_states() {
+    let tmp = tempfile::tempdir().unwrap(); let mut a = app(tmp.path()); a.today = chrono::NaiveDate::from_ymd_opt(2025, 4, 20); let c = C::login(&a, None);
+    let feed = c.get("/api/v1/insights"); let cards = feed["cards"].as_array().unwrap().clone();
+    let b = cards.iter().find(|x| x["kind"] == "budget").unwrap_or_else(|| panic!("a budget card: {feed}"))["id"].as_str().unwrap().to_string(); assert!(feed["cards"][0]["snoozed_until"].is_null());
+    let kinds: std::collections::BTreeSet<&str> = cards.iter().filter_map(|x| x["kind"].as_str()).collect(); assert!(kinds.contains("budget") && kinds.contains("forecast"), "{kinds:?}");
+    let ids = |v: &Value| v["cards"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // a budget card (ui-state.json): dismiss hides it, restore brings it back
+    let (s, v) = c.call("POST", &format!("/api/v1/insights/{b}/dismiss"), Some(json!({}))); assert_eq!((s, v["dismissed"].as_bool()), (200, Some(true)), "{v}");
+    let f = c.get("/api/v1/insights"); assert!(!ids(&f).contains(&b)); assert_eq!(f["hidden"].as_u64().unwrap(), feed["hidden"].as_u64().unwrap() + 1);
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(tmp.path().join("data/ui-state.json")).unwrap()).unwrap(); assert_eq!(st["dismissed"], json!([b]), "Python-compatible ui-state.json");
+    assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/restore"), Some(json!({}))).1["restored"], true); assert!(ids(&c.get("/api/v1/insights")).contains(&b));
+    // snooze: hidden until the date, shown with include_snoozed and its date
+    let (s, v) = c.call("POST", &format!("/api/v1/insights/{b}/snooze"), Some(json!({"days": 3}))); assert_eq!((s, v["snoozed_until"].as_str()), (200, Some("2025-04-23")), "{v}");
+    assert!(!ids(&c.get("/api/v1/insights")).contains(&b)); let inc = c.get("/api/v1/insights?include_snoozed=true"); assert_eq!(inc["cards"].as_array().unwrap().iter().find(|x| x["id"] == b.as_str()).unwrap()["snoozed_until"], "2025-04-23");
+    assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/snooze"), Some(json!({"days": 999}))).0, 422);
+    c.call("POST", &format!("/api/v1/insights/{b}/restore"), Some(json!({})));
+    // every other card kind (anomaly, price change, forecast) can be dismissed and restored too
+    for k in cards.iter().filter(|x| x["id"] != b.as_str()) { let id = k["id"].as_str().unwrap();
+        let (s, v) = c.call("POST", &format!("/api/v1/insights/{id}/done"), Some(json!({}))); assert_eq!(s, 200, "{} {v}", k["kind"]); assert!(!ids(&c.get("/api/v1/insights")).contains(&id.to_string()), "{}", k["kind"]);
+        c.call("POST", &format!("/api/v1/insights/{id}/restore"), Some(json!({}))); assert!(ids(&c.get("/api/v1/insights")).contains(&id.to_string()), "{} restored", k["kind"]); }
+    assert_eq!(c.call("POST", "/api/v1/insights/ins_0000000000/dismiss", Some(json!({}))).0, 404); assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/read"), Some(json!({}))).0, 404);
+    // the coach's own insights: status in the database
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO insights(id, created, kind, title, body, status) VALUES ('cin_1', '2025-04-19', 'answer', 't', 'b', 'new')", []).unwrap();
+    assert_eq!(c.call("POST", "/api/v1/insights/cin_1/snooze", Some(json!({"days": 2}))).1["snoozed_until"], "2025-04-22"); assert!(c.get("/api/v1/insights")["coach"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(c.get("/api/v1/insights?include_snoozed=true")["coach"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(c.call("POST", "/api/v1/insights/cin_1/restore", Some(json!({}))).1["status"], "new"); assert_eq!(c.get("/api/v1/insights")["coach"]["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn coach_resolve() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None);
+    let t = c.get("/api/v1/transactions?q=colruyt&limit=1")["items"][0].clone(); let h = finch::privacy::stable_hash(t["tx_key"].as_str().unwrap());
+    let rec = c.get("/api/v1/subscriptions?status=all")["series"][0]["id"].as_str().unwrap().to_string();
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO anomalies(id, type, severity, payload, first_seen, last_seen) VALUES ('anm_abc123', 'new_merchant', 'low', '{}', 'x', 'x')", []).unwrap();
+    let (s, v) = c.call("POST", "/api/v1/coach/resolve", Some(json!({"refs": [h, rec, "anm_abc123", "anm_ffffff", "chg_ffffff", "h_0000000000", "zz", h]}))); assert_eq!(s, 200, "{v}"); let m = &v["refs"];
+    assert_eq!(m[&h], json!({"kind": "transaction", "tx_key": t["tx_key"], "date": t["date"], "amount": t["amount"], "category": t["category"], "merchant": t["entity"]}));
+    assert_eq!(m[&rec]["link"], "/subscriptions"); assert_eq!(m["anm_abc123"]["kind"], "anomaly");
+    for x in ["anm_ffffff", "chg_ffffff", "h_0000000000", "zz"] { assert!(m.get(x).is_some_and(Value::is_null), "an invented ref resolves to nothing: {x}"); }
+    assert_eq!(c.call("POST", "/api/v1/coach/resolve", Some(json!({"refs": []}))).0, 422);
+}
+
+#[test]
+fn rental_writes_and_indicators() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None); let m = tmp.path().join("memory");
+    std::fs::write(m.join("assets.yaml"), "assets:\n  - id: flat\n    kind: real_estate_rental\n    account: Zichtrekening\n    value: 200000\n    as_of: 2025-04-01\n    rent_monthly: 700\n").unwrap();
+    std::fs::create_dir_all(m.join("liabilities")).unwrap(); std::fs::write(m.join("liabilities/hyp.yaml"), "id: hyp\nkind: mortgage\nasset: flat\noutstanding: 150000\noutstanding_as_of: 2025-04-01\nrate:\n  type: fixed\n  nominal: 3.5\n").unwrap();
+    let assets = || std::fs::read_to_string(m.join("assets.yaml")).unwrap();
+    // indicators: no market rate recorded (nothing is looked up), the equity from the declared value and outstanding
+    let i = c.get("/api/v1/rental/flat/indicators"); assert_eq!(i["market_rate"]["status"], "missing"); assert_eq!(i["loan_rate"]["missing"], json!(["a market rate you entered"]));
+    assert_eq!((i["equity"]["status"].as_str(), i["equity"]["net_equity"].as_str(), i["equity"]["outstanding"].as_str()), (Some("computed"), Some("50000.00"), Some("150000.00"))); assert_eq!(i["disclaimer_key"], "loan");
+    assert_eq!(c.call("GET", "/api/v1/rental/nope/indicators", None).0, 404); assert_eq!(c.call("GET", "/api/v1/rental/flat/indicators?market_rate=99", None).0, 422);
+    let g = c.get("/api/v1/rental/flat/indicators?market_rate=3.4&market_date=2025-05-01"); assert_eq!((g["loan_rate"]["status"].as_str(), g["market_rate"]["basis"].as_str()), (Some("close_to_market"), Some("given for this call")));
+    // a market rate the owner typed in: previewed, then recorded through the memory store
+    let before = assets(); let (s, v) = c.call("POST", "/api/v1/rental/flat/market-rate?dry_run=true", Some(json!({"rate_pct": 2.5, "as_of": "2025-03-01", "source": "own quote"}))); assert_eq!((s, v["changed"].as_bool()), (200, Some(true)), "{v}"); assert_eq!(assets(), before, "a dry run writes nothing");
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/market-rate", Some(json!({"rate_pct": 30}))).0, 422);
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/market-rate", Some(json!({"rate_pct": 2.5, "as_of": "2025-03-01", "source": "own quote"}))).0, 200);
+    let i = c.get("/api/v1/rental/flat/indicators"); assert_eq!((i["market_rate"]["basis"].as_str(), i["market_rate"]["age_days"].as_i64(), i["loan_rate"]["status"].as_str(), i["loan_rate"]["gap_pts"].as_f64()), (Some("recorded on the property"), Some(70), Some("above_market"), Some(1.0)));
+    assert!(i["market_rate"]["warning"].as_str().unwrap().contains("70 days old")); let sig: Vec<&str> = i["signals"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect(); assert_eq!(sig, ["rate_above_market", "equity_positive"]);
+    assert!(i["loan_rate"]["reading"].as_str().unwrap().ends_with("This is general information, not financial advice."));
+    // a vacancy period
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/vacancy", Some(json!({"start": "2025-03-01", "end": "2025-02-01"}))).0, 422);
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/vacancy", Some(json!({"start": "2025-03-01", "end": "2025-03-31", "note": "works"}))).0, 200);
+    let rd = c.get("/api/v1/rental/flat"); assert_eq!(rd["asset"]["vacancies"], json!([{"start": "2025-03-01", "end": "2025-03-31", "note": "works"}])); assert_eq!(rd["asset"]["market_rate"]["rate_pct"], 2.5);
+    // the commitment the owner recorded shows, and the extension decision is recorded on it
+    assert_eq!(rd["scheme"]["declared"], false); assert_eq!(c.call("POST", "/api/v1/rental/flat/extension", Some(json!({"decision": "extend"}))).0, 422, "an extension needs its years");
+    assert_eq!(c.call("PUT", "/api/v1/memory/assets/flat", Some(json!({"fields": {"commitment": {"start_date": "2016-06-01", "years": 9, "rent_cap_monthly": 650}}}))).0, 200);
+    let sc = c.get("/api/v1/rental/flat")["scheme"].clone(); assert_eq!((sc["state"].as_str(), sc["end_date"].as_str(), sc["decision_needed"].as_bool()), (Some("active"), Some("2025-05-31"), Some(true)), "{sc}");
+    assert_eq!((sc["rent_cap"]["status"].as_str(), sc["rent_cap"]["gap"].as_str()), (Some("above_cap"), Some("50.00")));
+    let (s, v) = c.call("POST", "/api/v1/rental/flat/extension", Some(json!({"decision": "extend", "years": 3, "note": "x"}))); assert_eq!(s, 200, "{v}");
+    let rd = c.get("/api/v1/rental/flat"); assert_eq!((rd["scheme"]["effective_end_date"].as_str(), rd["scheme"]["extension"]["decision"].as_str(), rd["scheme"]["decision_needed"].as_bool()), (Some("2028-05-31"), Some("extend"), Some(false)));
+    assert_eq!(rd["asset"]["commitment"]["extension"]["decided_on"], "2025-05-10"); assert_eq!(c.get("/api/v1/rental/properties")["properties"][0]["scheme"]["state"], "active");
+    assert_eq!(c.get("/api/v1/rental/flat/indicators")["commitment"]["effective_end_date"], "2028-05-31");
+    assert_eq!(c.call("POST", "/api/v1/rental/nope/vacancy", Some(json!({"start": "2025-03-01"}))).0, 404);
+}
+
+fn git_ok() -> bool { std::process::Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) }
+#[test]
+fn memory_lists_and_health() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None); let m = tmp.path().join("memory");
+    std::fs::write(m.join("household.yaml"), "members:\n  - id: zorro\n    name: Zorro Testmans\n    role: adult\n    birth_year: 1980\n    aliases: [ZT]\n  - id: kiki\n    name: Kiki Testmans\n    role: child\n").unwrap();
+    std::fs::write(m.join("events.yaml"), "events:\n  - id: trip-x\n    title: Trip X\n    start: 2025-03-01\n    budget: 500\n").unwrap();
+    std::fs::write(m.join("events.md"), "# Events\n\n## works-y\nsome works\n\n## trip-x\n").unwrap();
+    std::fs::create_dir_all(m.join("contracts")).unwrap(); std::fs::write(m.join("contracts/net.yaml"), "id: net\nprovider: Quuxnet\nkind: telecom\nbilling:\n  amount: 45.5\n  period: monthly\nnotice_period_days: 30\nusage:\n  frequency: daily\n").unwrap();
+    let h = c.get("/api/v1/household"); assert_eq!(h["members"][0]["birth_year"], 1980); assert_eq!(h["members"][0]["aliases"], json!(["ZT"])); assert_eq!(h["members"][1]["role"], "child");
+    let ev = c.get("/api/v1/events")["events"].clone(); assert_eq!(ev, json!([{"id": "trip-x", "title": "Trip X", "start": "2025-03-01", "end": null, "budget": "500.00", "status": null, "note": null, "source": "events.yaml"}, {"id": "works-y", "title": null, "start": null, "end": null, "budget": null, "status": null, "note": null, "source": "events.md"}]));
+    assert_eq!(c.get("/api/v1/meta/filters")["events"].as_array().unwrap().len(), 2);
+    let ct = c.get("/api/v1/contracts"); assert_eq!(ct["contracts"][0]["file"], "contracts/net.yaml"); assert_eq!(ct["contracts"][0]["billing"]["amount"], "45.50"); assert_eq!(ct["contracts"][0]["usage"]["frequency"], "daily");
+    let o = c.get("/api/v1/memory/overview")["counts"].clone(); assert_eq!((o["contracts"].as_i64(), o["events"].as_i64(), o["members"].as_i64(), o["liabilities"].as_i64()), (Some(1), Some(2), Some(2), Some(0)));
+    assert_eq!(c.get("/api/v1/session")["memory_history"], true);
+    // health: the memory check and the last scheduled run (step names, statuses and counts only)
+    std::fs::write(m.join("budgets.yaml"), "budgets: [oops\n").unwrap();
+    let logs = a.cfg.log_dir(); std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("runs.jsonl.1"), "{\"run\": \"r1\", \"event\": \"run_start\", \"ts\": \"2025-05-08T06:00:00\"}\n").unwrap();
+    std::fs::write(logs.join("runs.jsonl"), "{\"run\": \"r2\", \"event\": \"run_start\", \"ts\": \"2025-05-09T06:00:00\"}\nnot json\n{\"run\": \"r2\", \"event\": \"step\", \"step\": \"sync\", \"status\": \"error\", \"ms\": 12, \"counts\": {\"new\": 0}}\n{\"run\": \"r2\", \"event\": \"run_end\", \"ts\": \"2025-05-09T06:00:02\", \"outcome\": \"failed\", \"exit\": 1, \"ms\": 2345}\n").unwrap();
+    let hl = c.get("/api/v1/health"); assert_eq!(hl["memory"]["errors"], 1, "{hl}"); assert_eq!(hl["memory"]["by_code"]["invalid"], 1);
+    assert_eq!((hl["last_run"]["run"].as_str(), hl["last_run"]["outcome"].as_str(), hl["last_run"]["duration_s"].as_f64()), (Some("r2"), Some("failed"), Some(2.3))); assert_eq!(hl["last_run"]["failed"], json!(["sync"]));
+    std::fs::write(m.join("budgets.yaml"), "budgets: []\n").unwrap();
+    // removing a split; the audit lists the memory history with its source
+    let key = c.get("/api/v1/transactions?q=colruyt&limit=1")["items"][0]["tx_key"].as_str().unwrap().to_string();
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO tx_splits(tx_key, amount, category) VALUES (?1, -100, 'food.groceries'), (?1, -20.5, 'shopping.other')", [&key]).unwrap();
+    let (s, v) = c.call("POST", "/api/v1/transactions/split/clear", Some(json!({"tx_key": key}))); assert_eq!((s, v["removed"].as_i64()), (200, Some(2)), "{v}");
+    assert_eq!(c.call("POST", "/api/v1/transactions/split/clear", Some(json!({}))).0, 422);
+    if git_ok() { assert_eq!(c.call("POST", "/api/v1/goals", Some(json!({"id": "buffer", "target": "1000"}))).0, 200);
+        let au = c.get("/api/v1/household/audit"); assert!(au["memory"].as_array().unwrap().iter().any(|x| x["source"] == "ui" && x["files"] == json!(["goals.yaml"])), "{au}"); }
+}

@@ -17,7 +17,10 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 
 ## Next: parity with the Python app
 
-- **B4 Web endpoint parity [agent].** List every endpoint `web/src/api/hooks.ts` and the pages call that answers 404 `not_ported`
+- **B4 Web endpoint parity [agent; in progress 2026-11-24: done `GET /household`, `/events`, `/contracts`, `POST /transactions/split/clear`, the
+  filters / overview / session / audit / health stubs, dismiss / snooze / restore of every insight card kind (`ui-state.json`), `POST /coach/resolve`,
+  the rental extension / vacancy / market-rate writes and `GET /rental/{id}/indicators`; left to other decisions: `/setup/wizard`, `/onboarding*`,
+  `/review/suggest` + `/review/ai`, asset rename, passkeys].** List every endpoint `web/src/api/hooks.ts` and the pages call that answers 404 `not_ported`
   in `src/web/routes.rs` / `memory_routes.rs`, then port them one by one (incl. dismissing every insight kind, not only anomalies and
   price changes). Each new endpoint gets a test in `tests/web.rs`; a child-visible one goes into `CHILD_ALLOWED` on purpose only.
 - **B5 MCP tool parity [agent].** The Python server has tools finch lacks (e.g. `explain_transaction`, `memory_context`,

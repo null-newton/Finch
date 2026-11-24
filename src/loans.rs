@@ -25,7 +25,7 @@ pub struct Liability { pub id: String, pub kind: String, pub lender: Option<Stri
 #[derive(Debug, Clone, Default, Deserialize)] #[serde(default)]
 pub struct Asset { pub id: String, pub kind: String, pub provider: Option<String>, pub holder: Option<String>, pub holders: Option<serde_yaml::Value>, pub balance: Option<f64>, pub value: Option<f64>, pub as_of: Option<String>, pub liquidity: Option<String>,
     pub connected: Option<bool>, pub contribution_monthly: Option<f64>, pub description: Option<String>, pub purchase_price: Option<f64>, pub purchase_date: Option<String>, pub rent_monthly: Option<f64>, pub account: Option<String>, pub loan: Option<String>,
-    pub lease: Option<Lease>, pub vacancies: Vec<Vacancy>, pub market_rate: Option<serde_yaml::Value>, pub scheme: Option<String> }
+    pub lease: Option<Lease>, pub vacancies: Vec<Vacancy>, pub market_rate: Option<serde_yaml::Value>, pub scheme: Option<String>, pub commitment: Option<serde_yaml::Value> }
 /// A Belgian residential lease, as the owner states it (no index is ever looked up).
 #[derive(Debug, Clone, Default, Deserialize)] #[serde(default)]
 pub struct Lease { pub start_date: Option<String>, pub base_rent: Option<f64>, pub base_index: Option<f64>, pub current_index: Option<f64>, pub current_index_month: Option<String>, pub registered: Option<bool> }
