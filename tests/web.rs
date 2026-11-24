@@ -227,3 +227,61 @@ fn memory_lists_and_health() {
     if git_ok() { assert_eq!(c.call("POST", "/api/v1/goals", Some(json!({"id": "buffer", "target": "1000"}))).0, 200);
         let au = c.get("/api/v1/household/audit"); assert!(au["memory"].as_array().unwrap().iter().any(|x| x["source"] == "ui" && x["files"] == json!(["goals.yaml"])), "{au}"); }
 }
+
+/// A fake HTTP transport answering like Ollama: it records every body (no test reaches the network).
+#[derive(Clone, Default)]
+struct FakeLlm(Arc<std::sync::Mutex<Vec<String>>>);
+impl finch::net::Http for FakeLlm {
+    fn send(&self, _m: &str, _u: &str, _h: &[(&str, String)], body: Option<&Value>) -> anyhow::Result<finch::net::Response> {
+        self.0.lock().unwrap().push(body.map(|b| b.to_string()).unwrap_or_default());
+        let content = json!({"results": [{"id": 0, "merchant": "Zephyrbak", "category": "food.groceries", "confidence": 0.912, "recurring_hint": false}]}).to_string();
+        Ok(finch::net::Response { status: 200, body: json!({"message": {"content": content}, "prompt_eval_count": 120, "eval_count": 30}).to_string() })
+    }
+}
+/// The Review page's AI suggestion app: a low-confidence LLM label on a card merchant whose key holds a family name and a town.
+fn suggest_app(dir: &Path, enable: bool, offline: bool) -> (App, FakeLlm, String) {
+    let mut a = app(dir); let con = db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap(); let key = "ZEPHYRBAK TESTMANS GENT".to_string();
+    con.execute("UPDATE tx_enriched SET merchant_key=?1, merchant_raw=?1 WHERE merchant_raw LIKE '%COLRUYT%'", [&key]).unwrap();
+    classify::llm::upsert_label(&con, &key, "Zephyrbak", "other.uncategorized", Some(0.4), None, "llm", "fake").unwrap();
+    std::fs::write(dir.join("memory/household.yaml"), "members:\n  - id: zorro\n    name: Zorro Testmans\n    role: adult\n  - id: kiki\n    name: Kiki Testmans\n    role: child\nplaces:\n  - Gent\n").unwrap();
+    let fake = FakeLlm::default(); let f = fake.clone(); a.http = Arc::new(move || Box::new(f.clone()));
+    (a.cfg.review_suggest, a.cfg.llm_backend, a.cfg.privacy_offline) = (enable, "ollama".into(), offline); (a, fake, key)
+}
+
+#[test]
+fn review_ai_suggestion() {
+    // off by default: the shape the page reads, web search never, nothing sent
+    let tmp = tempfile::tempdir().unwrap(); let (a, fake, key) = suggest_app(tmp.path(), false, false); let c = C::login(&a, None);
+    let ai = c.get("/api/v1/review/ai"); assert_eq!((ai["web"]["allowed"].as_bool(), ai["web"]["code"].as_str()), (Some(false), Some("not_ported")), "{ai}");
+    assert!(ai["web"]["why"].as_str().unwrap().contains("not ported") && ai["label"]["allowed"] == false && ai["label"]["code"] == "disabled", "{ai}");
+    let (s, v) = c.call("POST", "/api/v1/review/suggest", Some(json!({"key": key}))); assert_eq!((s, v["error"]["code"].as_str()), (409, Some("disabled")), "{v}");
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO ui_users(id, member_id, role, created_at) VALUES ('kiki-login', 'kiki', 'child', '2025-01-01')", []).unwrap();
+    let kid = C::login(&a, Some("kiki-login"));
+    for (m, p) in [("POST", "/api/v1/review/suggest"), ("GET", "/api/v1/review/ai"), ("GET", "/api/v1/review/suggest/s_x")] { let r = kid.raw(m, p, (m == "POST").then(|| json!({"key": key})), &[]); assert_eq!((r.status, code(&r)), (403, "forbidden_scope".into()), "{p}"); }
+    assert!(fake.0.lock().unwrap().is_empty());
+    // [privacy] offline refuses the flow (even towards a loopback Ollama)
+    let tmp = tempfile::tempdir().unwrap(); let (a, fake, key) = suggest_app(tmp.path(), true, true); let c = C::login(&a, None);
+    let ai = c.get("/api/v1/review/ai"); assert_eq!((ai["label"]["allowed"].as_bool(), ai["label"]["code"].as_str()), (Some(false), Some("egress_refused")), "{ai}");
+    let (s, v) = c.call("POST", "/api/v1/review/suggest", Some(json!({"key": key}))); assert_eq!((s, v["error"]["code"].as_str()), (409, Some("egress_refused")), "{v}");
+    assert!(fake.0.lock().unwrap().is_empty(), "nothing sent offline");
+    // enabled: a job, the redacted label only, a proposal that changes nothing
+    let tmp = tempfile::tempdir().unwrap(); let (a, fake, key) = suggest_app(tmp.path(), true, false); let c = C::login(&a, None);
+    assert_eq!(c.get("/api/v1/review/ai")["label"]["allowed"], true);
+    let (s, v) = c.call("POST", "/api/v1/review/suggest", Some(json!({"key": "NOT IN THE QUEUE"}))); assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_in_queue")));
+    let (s, j) = c.call("POST", "/api/v1/review/suggest", Some(json!({"key": key, "max_conf": 0.7}))); assert_eq!(s, 200, "{j}");
+    let id = j["id"].as_str().unwrap().to_string(); assert!(id.starts_with("s_") && ["running", "done"].contains(&j["state"].as_str().unwrap()));
+    let j = c.get(&format!("/api/v1/review/suggest/{id}")); assert_eq!(j["state"], "done", "{j}");
+    assert_eq!((j["suggestion"]["category"].as_str(), j["suggestion"]["confidence"].as_f64(), j["suggestion"]["mode"].as_str(), j["mode"].as_str()), (Some("food.groceries"), Some(0.91), Some("label"), Some("label")));
+    assert!(j["ai_generated"] == true && j["ai_label_short"] == "AI-generated" && j["suggestion"]["evidence"].is_null());
+    let sent = fake.0.lock().unwrap().clone(); assert_eq!(sent.len(), 1); let b = &sent[0];
+    assert!(b.contains("ZEPHYRBAK [NAME]") && b.contains("food.groceries") && b.contains(r#"\"avg_amount\":100"#), "{b}");
+    for bad in ["TESTMANS", "Testmans", "Zorro", "GENT", "Gent", "4871", "1234", "120.5", "120,5", "DEBETKAART", "BETALING", "PROXIMUS", "QUUXCORP", "Zichtrekening", "KBC"] { assert!(!b.contains(bad), "{bad} leaked: {b}"); }
+    let con = db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap();
+    let m: (String, f64, String) = con.query_row("SELECT category, confidence, source FROM merchants WHERE merchant_key=?", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(m, ("other.uncategorized".into(), 0.4, "llm".into()), "a suggestion is not stored");
+    assert_eq!(con.query_row("SELECT COUNT(*) FROM llm_usage WHERE purpose='suggest' AND backend='ollama'", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "usage logged");
+    let kinds: Vec<String> = con.prepare("SELECT kind FROM egress_journal WHERE outcome='allowed' ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().flatten().collect(); assert_eq!(kinds, ["classify.suggest", "llm.ollama"]);
+    assert_eq!(c.call("GET", "/api/v1/review/suggest/s_nope", None).0, 404);
+    // applying it stays the user's click on the existing category fix
+    assert_eq!(c.call("POST", "/api/v1/review/correct", Some(json!({"key": key, "category": "food.groceries"}))).0, 200);
+}

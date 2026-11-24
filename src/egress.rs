@@ -7,7 +7,8 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 
 /// (kind, external, local_only behaviour, offline behaviour, redaction mode, default host)
-pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 11] = [
+pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 12] = [
+    ("classify.suggest", true, "refused", "refused", "label-only", "the [llm] backend (one redacted merchant label from the review queue; opt-in [classify] review_suggest)"),
     ("update.github", true, "refused", "refused", "none", "github.com (the desktop app's signed update check: sends no data)"),
     ("alerts.email", true, "refused", "refused", "minimal-guarded", "the SMTP server of [alerts.email] host"),
     ("alerts.macos", false, "allowed", "allowed", "minimal-guarded", "this Mac (notification centre)"),

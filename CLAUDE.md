@@ -24,7 +24,7 @@ financial life: treat every figure, name and merchant as private. **Numbers come
 - **Crate** `finch` (`Cargo.toml`, lib + bin): `src/lib.rs` lists every module; each file starts with a `//!` line saying what it owns.
   CLI in `src/main.rs`. Features: `sqlcipher` (encrypted DB, needs full perl on Windows), `keychain` (OS secret store).
 - **Data path**: `ingest/` (CSV / OFX / CAMT.053 / CODA imports, `bank.rs` = Enable Banking sync) -> `db.rs` + `migrations/` (schema shared
-  with the Python app) -> `classify/` (`parsers/belgian.rs`, `rules.rs` + `assets/rules.yaml`, `llm.rs`, `batch.rs`) -> `analytics/`
+  with the Python app) -> `classify/` (`parsers/belgian.rs`, `rules.rs` + `assets/rules.yaml`, `llm.rs`, `batch.rs`, `suggest.rs` = the Review page's label-only AI suggestion) -> `analytics/`
   (pure functions over a `Dataset`), `transfers.rs`, `insights.rs`, `alerts.rs`.
 - **Household & memory**: `memory.rs` (read-only), `memstore.rs` (the ONLY writer), `proposals.rs`, `questions.rs`, `qgen.rs`,
   `household.rs`, `docs.rs`. Wealth: `loans.rs`, `loans_extra.rs`, `rental.rs`, `subs.rs`, `subs_extra.rs`; `tax.rs` (Belgian tax-return candidates). Legal wording: `disclaimers.rs`.

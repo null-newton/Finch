@@ -4,6 +4,7 @@ pub mod batch;
 pub mod llm;
 pub mod parsers;
 pub mod rules;
+pub mod suggest;
 
 use anyhow::Result;
 use parsers::{common::household, parse_tx, RawTx};

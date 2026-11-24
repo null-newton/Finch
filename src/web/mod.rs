@@ -86,12 +86,14 @@ pub struct Snap { pub ds: Dataset, pub rec: Recurring }
 pub type HttpFactory = Arc<dyn Fn() -> Box<dyn Http> + Send + Sync>;
 
 pub struct App { pub cfg: Config, pub insecure: bool, pub sec: Security, pub static_dir: PathBuf, pub today: Option<NaiveDate>, pub http: HttpFactory,
-    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, views: Mutex<HashMap<String, Arc<Snap>>>, pub coach: Arc<dyn crate::coach::Spawner>, pub coach_job: Mutex<Option<(String, Arc<std::sync::atomic::AtomicBool>)>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>> }
+    pub sync_job: Mutex<Job>, pub auth_job: Mutex<Job>, gen: AtomicU64, snap: Mutex<Option<(String, Arc<Snap>)>>, views: Mutex<HashMap<String, Arc<Snap>>>, pub coach: Arc<dyn crate::coach::Spawner>, pub coach_job: Mutex<Option<(String, Arc<std::sync::atomic::AtomicBool>)>>, pub inline_jobs: bool, pub me: std::sync::OnceLock<std::sync::Weak<App>>,
+    /// The review queue's AI suggestions (polled), and the process runner of the claude-code backend (tests inject a fake).
+    pub suggest_jobs: Mutex<Vec<crate::classify::suggest::Job>>, pub runner: Arc<dyn crate::net::Runner + Send + Sync> }
 impl App {
     pub fn new(cfg: Config, insecure: bool, port: u16, dev: bool, static_dir: PathBuf, http: HttpFactory) -> Result<Self> {
         let secret = security::load_secret(&cfg.data_dir, cfg.ui_key_rotation_days)?;
         let sec = Security::new(secret, port, if dev { &DEV_PORTS } else { &[] }, cfg.ui_session_hours, &cfg.data_dir);
-        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), views: Mutex::new(HashMap::new()), coach: Arc::new(crate::coach::ProcessSpawner), coach_job: Mutex::new(None), inline_jobs: false, me: Default::default() })
+        Ok(Self { cfg, insecure, sec, static_dir, today: None, http, sync_job: Mutex::new(Job::idle("sync")), auth_job: Mutex::new(Job::idle("connect")), gen: AtomicU64::new(0), snap: Mutex::new(None), views: Mutex::new(HashMap::new()), coach: Arc::new(crate::coach::ProcessSpawner), coach_job: Mutex::new(None), inline_jobs: false, me: Default::default(), suggest_jobs: Mutex::new(vec![]), runner: Arc::new(crate::net::ProcessRunner) })
     }
     pub fn con(&self) -> Result<Connection> { db::connect(&self.cfg, db::Opts { insecure: self.insecure, ..Default::default() }) }
     /// Every write calls this: the next read recomputes the dataset.

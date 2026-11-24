@@ -66,7 +66,7 @@ pub fn hold_back(key: &str, raw: Option<&str>, types: &Set, family: &Set, first:
     if known.contains(key) || allowed { return false; }
     !(organisation_like(key, family, first) || organisation_like(text, family, first))
 }
-fn known_merchants(con: &Connection) -> Result<Set> { Ok(con.prepare("SELECT DISTINCT m.merchant_key FROM merchants m JOIN tx_enriched e ON e.merchant_key=m.merchant_key WHERE e.tx_type IN ('card','card_refund','direct_debit') AND m.category IS NOT NULL")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?) }
+pub fn known_merchants(con: &Connection) -> Result<Set> { Ok(con.prepare("SELECT DISTINCT m.merchant_key FROM merchants m JOIN tx_enriched e ON e.merchant_key=m.merchant_key WHERE e.tx_type IN ('card','card_refund','direct_debit') AND m.category IS NOT NULL")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?) }
 fn needs_llm_sql(rules: &Rules) -> String { format!("COALESCE(e.tx_type,'') NOT IN ({})", rules.type_rules.keys().map(|t| format!("'{}'", t.replace('\'', ""))).collect::<Vec<_>>().join(",")) }
 
 #[derive(Debug, Clone)]
@@ -188,6 +188,8 @@ pub fn validate_results(results: &Value, n: usize, rules: &Rules) -> Vec<(usize,
     }
     out
 }
+/// The static labelling prompt: the instructions and the taxonomy.
+pub fn label_static(rules: &Rules) -> String { format!("{LABEL_HEAD}\n\nCategories:\n{}", rules.categories.iter().map(|(k, v)| format!("- {k}: {v}")).collect::<Vec<_>>().join("\n")) }
 pub struct Job { pub keys: Vec<String>, pub stat: String, pub dynamic: String }
 /// The exact (redacted) requests of a run.
 pub fn prepare_jobs(con: &Connection, cfg: &Config, rules: &Rules, keys: &[String], batch: usize, index: Option<&Index>) -> Result<Vec<Job>> {
@@ -196,7 +198,7 @@ pub fn prepare_jobs(con: &Connection, cfg: &Config, rules: &Rules, keys: &[Strin
     let ok = eligible_label_keys(con, cfg)?;
     let ex: Vec<(String, String, String)> = con.prepare("SELECT merchant_key, COALESCE(merchant_name, merchant_key), category FROM merchants WHERE source='user' ORDER BY updated_at DESC")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.flatten().filter(|e: &(String, String, String)| ok.contains(&e.0)).take(40).collect();
     let shots = if ex.is_empty() { "(none yet)".into() } else { ex.iter().map(|(k, n, c)| format!("- \"{}\" -> {c} ({})", redact_names(k, &names), redact_names(n, &names))).collect::<Vec<_>>().join("\n") };
-    let stat = format!("{LABEL_HEAD}\n\nCategories:\n{}", rules.categories.iter().map(|(k, v)| format!("- {k}: {v}")).collect::<Vec<_>>().join("\n"));
+    let stat = label_static(rules);
     let mut jobs = vec![];
     for b in keys.chunks(batch.max(1)) {
         let mut items = vec![];
