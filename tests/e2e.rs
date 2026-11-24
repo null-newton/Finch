@@ -74,9 +74,8 @@ fn injected_instructions_are_flagged_and_wrapped() {
     assert!(r.data.get("security_notice").is_some(), "{}", r.text); assert!(s.suspicious);
 }
 
-#[test]
-fn phase2_recurring_prices_anomalies_transfers_forecast() {
-    use finch::{analytics::{anomalies, planning, recurring}, classify::rules::Rules, transfers};
+/// Eight months on a current account (salary, a subscription with a price rise, a direct debit, groceries, savings) and a savings account (CODA).
+fn phase2_data() -> (tempfile::TempDir, config::Config, rusqlite::Connection) {
     let tmp = tempfile::tempdir().unwrap(); let cfg = home(tmp.path());
     std::fs::write(tmp.path().join("memory/budgets.yaml"), "budgets:\n  - id: groceries\n    category: food.groceries\n    monthly: 150\n").unwrap();
     std::fs::write(tmp.path().join("memory/goals.yaml"), "goals:\n  - id: buffer\n    target_amount: 5000\n    tag: savings\n    monthly_contribution: 200\n").unwrap();
@@ -101,6 +100,13 @@ fn phase2_recurring_prices_anomalies_transfers_forecast() {
     let r = ingest::import_file(&con, &f2, ingest::ImportOpts { account: "new:Spaar", profile: None, fmt: None, dry_run: false, bank: Some("KBC"), currency: None, iban: None, force: false }).unwrap();
     assert!(r.warnings.iter().any(|w| w.contains("closing balance 3500.00")), "{:?}", r.warnings);
     classify::normalize_all(&con, Some(&cfg.memory_dir)).unwrap();
+    (tmp, cfg, con)
+}
+
+#[test]
+fn phase2_recurring_prices_anomalies_transfers_forecast() {
+    use finch::{analytics::{anomalies, planning, recurring}, classify::rules::Rules, transfers};
+    let (_tmp, cfg, con) = phase2_data();
 
     let rules = Rules::load(&cfg).unwrap();
     let tr = transfers::match_transfers(&con, &rules, &[], &cfg.memory_dir, &transfers::Opts::from(&cfg), true).unwrap();
@@ -134,6 +140,64 @@ fn phase2_recurring_prices_anomalies_transfers_forecast() {
         for leak in ["Quuxcorp", "QUUXCORP", "imp-zicht", "BE68", "BE12 3456", "BE12ZZZ"] { assert!(!r.text.contains(leak), "{tool} leaked {leak}: {}", r.text); }
     }
     assert!(!s.call("calendar", &json!({"account": "account-other-1"})).ok, "calendar takes no account scope");
+    for tool in ["budget_status", "calendar", "goals"] { let r = s.call(tool, &json!({"member": "adult-1"})); assert!(r.ok, "{tool} takes a member: {}", r.text); }
+    assert!(!s.call("goals", &json!({"member": "zorro"})).ok, "a real member id is refused");
+    let l = mcp::listing(); let ro = |n: &str| l["tools"].as_array().unwrap().iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} not listed"))["annotations"]["readOnlyHint"].clone();
+    for w in mcp::WRITERS { assert_eq!(ro(w), false, "{w} writes"); } assert_eq!(ro("coverage"), true);
+    let nw = s.call("net_worth", &json!({"history": true, "months": 6})); assert!(nw.ok && nw.data["history"].is_array(), "{}", nw.text);
+}
+
+const SKILL_LEAKS: [&str; 13] = ["Quuxcorp", "QUUXCORP", "Zorro", "ZORRO", "Testmans", "TESTMANS", "imp-zicht", "BE68", "BE12 3456", "BE12ZZZ", "Testbank", "kerkstraat", "Verzekeraar"];
+fn clean(tool: &str, r: &mcp::Output) { assert!(r.ok, "{tool}: {}", r.text); assert!(r.data.get("security_notice").is_none() && !r.text.contains("[NUM]"), "{tool}: our own texts and ids must pass the scanner and the redactor: {}", r.text); for leak in SKILL_LEAKS { assert!(!r.text.contains(leak), "{tool} leaked {leak}: {}", r.text); } }
+
+#[test]
+fn skill_tools_compute_and_leak_nothing() {
+    let (tmp, cfg, con) = phase2_data(); let m = tmp.path().join("memory"); std::fs::create_dir_all(m.join("liabilities")).unwrap();
+    std::fs::write(m.join("liabilities/hypotheek-kerkstraat.yaml"), "id: hypotheek-kerkstraat\nkind: mortgage\nlender: Testbank Hypotheek NV\nprincipal: 200000\nrate: {type: fixed, nominal: 3}\nstart_date: 2024-01-10\nterm_months: 240\ninsurance: {provider: Verzekeraar NV, monthly: 25}\n").unwrap();
+    std::fs::write(m.join("liabilities/autolening.yaml"), "id: autolening\nkind: car_loan\nlender: Testbank Auto\nmonthly_payment: 300\n").unwrap();
+    let key: String = con.query_row("SELECT tx_key FROM transactions t JOIN tx_enriched e USING(tx_key) WHERE t.description LIKE '%NETFLIX%' ORDER BY booking_date LIMIT 1", [], |r| r.get(0)).unwrap();
+    let mut s = mcp::Session::with(cfg, con, chrono::NaiveDate::from_ymd_opt(2025, 9, 2));
+    // explain_transaction: any ref of the data resolves, also one this session never returned
+    let r = s.call("explain_transaction", &json!({"tx_ref": finch::privacy::stable_hash(&key)})); clean("explain_transaction", &r);
+    assert_eq!(r.data["decision_chain"].as_array().unwrap().len(), 7); assert_eq!(r.data["pipeline"]["consistent"], true, "{}", r.text);
+    assert_eq!(r.data["final"]["category"], r.data["pipeline"]["category"]); assert!(r.data["account"].as_str().unwrap().starts_with("account-"));
+    assert_eq!(r.data["decision_chain"].as_array().unwrap().iter().filter(|x| x["decides"] == true).count(), 1, "{}", r.text);
+    assert!(!s.call("explain_transaction", &json!({"tx_ref": "h_0000000000"})).ok, "an unknown ref is refused"); assert!(!s.call("explain_transaction", &json!({"tx_ref": key})).ok, "a raw key is refused by the schema");
+    // monthly_review and explain_spike: movers against usual with hashed evidence, budgets at month end
+    let r = s.call("monthly_review", &json!({"month": "2025-08"})); clean("monthly_review", &r);
+    assert_eq!(r.data["month"], "2025-08"); let mv = r.data["movers"].as_array().unwrap(); assert!(!mv.is_empty(), "{}", r.text); assert!(mv[0]["evidence"][0].as_str().unwrap().starts_with("h_"), "{}", r.text); assert!(mv[0]["evidence"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().starts_with("rec_")), "series ids kept: {}", r.text); assert!(r.data.get("security_notice").is_none());
+    assert_eq!(r.data["budgets"]["items"][0]["id"], "groceries"); assert!(r.data["cash_flow"]["income"].is_string());
+    assert!(!s.call("monthly_review", &json!({"month": "2025-12"})).ok, "a month not started is refused");
+    assert!(s.call("monthly_review", &json!({"member": "adult-1"})).ok, "a member view");
+    let r = s.call("explain_spike", &json!({"category": "food", "month": "2025-08"})); clean("explain_spike", &r);
+    assert_eq!(r.data["scope"]["target"], "food"); assert!(r.data["top_transactions"][0]["tx_key"].as_str().unwrap().starts_with("h_")); assert!(r.data["totals"]["usual_ex_one_offs"].is_string(), "{}", r.text);
+    let acc = s.call("coverage", &json!({})).data["accounts"][0]["account"].as_str().unwrap().to_string();
+    let r = s.call("explain_spike", &json!({"account": acc, "month": "2025-08"})); clean("explain_spike", &r); assert_eq!(r.data["scope"]["target"], acc.as_str());
+    for bad in [json!({"category": "nope"}), json!({}), json!({"category": "food", "account": acc}), json!({"account": "imp-zicht"})] { assert!(!s.call("explain_spike", &bad).ok, "{bad}"); }
+    // subscription_audit: grouped, the price rise of the streaming series, review candidates; onboarding_status: the checklist by ref
+    let r = s.call("subscription_audit", &json!({})); clean("subscription_audit", &r);
+    assert!(r.data["items"].as_array().unwrap().iter().any(|i| i["price_change"].is_object() && i["group"] == "subscriptions"), "{}", r.text);
+    let cand = r.data["candidates"].as_array().unwrap(); assert!(cand.iter().any(|c| c["reasons"].as_array().unwrap().iter().any(|x| x == "usage_unknown")), "{}", r.text);
+    assert!(r.data["usage_questions_needed"][0]["series_id"].as_str().unwrap().starts_with("rec_")); assert!(!r.text.contains("[NUM]") && r.data.get("security_notice").is_none(), "ids and our own texts pass the redactor untouched: {}", r.text);
+    let r = s.call("onboarding_status", &json!({})); clean("onboarding_status", &r);
+    assert_eq!(r.data["steps"].as_array().unwrap().len(), 7); assert!(r.data.get("security_notice").is_none(), "{}", r.text); assert_eq!(r.data["steps"][0]["members_without_birth_year"]["members"][0], "adult-1"); let loans = r.data["steps"].as_array().unwrap().iter().find(|x| x["id"] == "loans").unwrap();
+    assert!(loans["liabilities"].as_array().unwrap().iter().all(|l| l["ref"].as_str().unwrap().starts_with("loan-")), "{}", r.text);
+    assert!(r.data["steps"].as_array().unwrap().iter().find(|x| x["id"] == "accounts").unwrap()["missing"][0]["account"].as_str().unwrap().starts_with("account-"));
+    // savings_estimate: a pure calculator; a quote older than 30 days is flagged
+    let r = s.call("savings_estimate", &json!({"current_monthly": 30, "alternative_monthly": 20, "switching_costs": 25, "quote_date": "2025-06-01"})); clean("savings_estimate", &r);
+    assert_eq!((r.data["monthly_saving"].as_str(), r.data["net_saving"].as_str(), r.data["break_even_months"].as_i64(), r.data["verdict"].as_str()), (Some("10.00"), Some("95.00"), Some(3), Some("saving")));
+    assert!(r.data["quote"]["warning"].as_str().is_some_and(|w| w.contains("93 days")), "{}", r.text);
+    assert_eq!(s.call("savings_estimate", &json!({"current_monthly": 20, "alternative_monthly": 25})).data["verdict"], "no_saving");
+    // mortgage_check: no rate given -> nothing is looked up; with the user's dated rate and quote -> computed on the schedule
+    let r = s.call("mortgage_check", &json!({})); clean("mortgage_check", &r);
+    assert_eq!(r.data["mortgages"].as_array().unwrap().len(), 1, "only mortgages by default"); assert_eq!(r.data["mortgages"][0]["renegotiation"]["status"], "needs_market_rate");
+    assert_eq!(r.data["mortgages"][0]["insurance_switch"]["current_monthly"], "25.00"); assert!(r.data["mortgages"][0]["early_repayment"]["max_indemnity"].is_string());
+    let r = s.call("mortgage_check", &json!({"market_rate_pct": 2.5, "market_rate_date": "2025-06-01", "variant": "external", "alternative_insurance_monthly": 15})); clean("mortgage_check", &r);
+    let mg = &r.data["mortgages"][0]; assert_eq!(mg["renegotiation"]["status"], "computed", "{}", r.text); assert_eq!(mg["renegotiation"]["variant"], "external"); assert_eq!(mg["renegotiation"]["penalty"], mg["early_repayment"]["max_indemnity"], "external: the legal 3-months cap");
+    assert_eq!(mg["insurance_switch"]["monthly_saving"], "10.00"); assert!(r.data["market_rate"]["warning"].as_str().is_some_and(|w| w.contains("93 days")));
+    let lo = s.call("loans_overview", &json!({})); let car = lo.data["loans"].as_array().unwrap().iter().find(|l| l["kind"] == "car_loan").unwrap()["ref"].as_str().unwrap().to_string();
+    let r = s.call("mortgage_check", &json!({"loan": car})); clean("mortgage_check", &r); assert!(r.data["what_i_need"][0].as_str().unwrap().contains("principal"), "{}", r.text); assert!(r.data.get("security_notice").is_none());
+    assert!(!s.call("mortgage_check", &json!({"loan": "autolening"})).ok, "a real loan id is refused");
 }
 
 #[test]

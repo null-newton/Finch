@@ -10,13 +10,17 @@ fn rf(map: &[(String, String)], id: &str) -> String { map.iter().find(|x| x.0 ==
 fn back(map: &[(String, String)], r: &str) -> Option<String> { map.iter().find(|x| x.1 == r).map(|x| x.0.clone()) }
 const NOTE: &str = "Items are given by kind and ref only. An item listed under `unknown` has no recorded figure: never estimate it; say it is missing and offer to propose it (memory_propose).";
 
-pub fn net_worth(ds: &Dataset, red: &Redactor) -> Value {
+pub fn net_worth(ds: &Dataset, red: &Redactor, con: &rusqlite::Connection, a: &Value) -> Result<Value, String> {
     let (am, lm) = refs(ds); let v = loans::net_worth(ds, ds.today, ds.settings.asset_stale_months as i32);
     let raw = json!({"as_of": v["as_of"], "net_worth": v["net_worth"], "complete": v["complete"], "n_unknown": v["n_unknown"], "by_category": v["by_category"], "by_owner": v["by_owner"], "bank_total": v["bank"]["total"],
         "assets": v["assets"]["items"].as_array().into_iter().flatten().map(|a| json!({"ref": rf(&am, a["id"].as_str().unwrap_or("")), "kind": a["kind"], "category": a["category"], "value": a["value"], "as_of": a["as_of"], "stale": a["stale"], "counted": a["counted"]})).collect::<Vec<_>>(),
         "liabilities": v["liabilities"]["items"].as_array().into_iter().flatten().map(|l| json!({"ref": rf(&lm, l["id"].as_str().unwrap_or("")), "kind": l["kind"], "outstanding": l["outstanding"], "source": l["source"], "stale": l["stale"], "counted": l["counted"]})).collect::<Vec<_>>(),
         "unknown": v["unknown"].as_array().into_iter().flatten().map(|u| { let k = u["kind"].as_str().unwrap_or(""); json!({"type": k, "ref": match k { "asset" => rf(&am, u["id"].as_str().unwrap_or("")), "liability" => rf(&lm, u["id"].as_str().unwrap_or("")), _ => "account".into() }, "reason": u["reason"]}) }).collect::<Vec<_>>(), "note": NOTE});
-    red.walk(&raw, None)
+    let mut out = red.walk(&raw, None);
+    if a["history"] == true { let h = crate::loans_extra::history(con, a["months"].as_i64().unwrap_or(24)).map_err(|e| format!("net_worth failed ({})", e.root_cause()))?;
+        out["history"] = h.iter().map(|p| json!({"month": p["month"], "as_of": p["as_of"], "source": p["source"], "net_worth": p["net_worth"], "assets": p["assets"], "liabilities": p["liabilities"], "by_category": p["by_category"], "n_unknown": p["n_unknown"], "complete": p["complete"]})).collect::<Vec<_>>().into();
+        out["history_note"] = "one point per month: the latest snapshot recorded that month (`finch loans snapshot`); a month with n_unknown > 0 is the known part only. Nothing is recorded by this tool.".into(); }
+    Ok(out)
 }
 pub fn loans_overview(ds: &Dataset, red: &Redactor, a: &Value) -> Result<Value, String> {
     let (_, lm) = refs(ds); let only = a["loan"].as_str().map(|r| back(&lm, r).ok_or("unknown loan: use a ref from net_worth or loans_overview (loan-N)")).transpose()?;
@@ -88,4 +92,32 @@ pub fn tax_candidates(ds: &Dataset, red: &Redactor, a: &Value) -> Result<Value, 
     }
     let mut out = red.walk(&v, None);
     out["note"] = "Candidates to check against the certificates and the pre-filled return, not entitlements: never present an amount as tax saved, never quote or look up a rate or ceiling, and end with the disclaimer. Assets and loans are refs (asset-N, loan-N), children pseudonyms.".into(); Ok(out)
+}
+
+/// The mortgage review on the stored schedule (Belgian rules): capital still due, the legal 3-months-of-interest cap, a renegotiation at a
+/// market rate THE USER gives (dated; never looked up) and a borrower-insurance switch at a quote the user gives. Missing fields are listed.
+pub fn mortgage_check(ds: &Dataset, red: &Redactor, a: &Value) -> Result<Value, String> {
+    let (_, lm) = refs(ds); let (ls, _) = loans::liabilities(&ds.memory_dir); let today = ds.today; let f = |k: &str| a[k].as_f64().unwrap_or(0.0);
+    let sel: Vec<&loans::Liability> = match a["loan"].as_str() { Some(r) => { let id = back(&lm, r).ok_or("unknown loan: use a ref from net_worth or loans_overview (loan-N)")?; ls.iter().filter(|l| l.id == id).collect() } None => ls.iter().filter(|l| l.kind == "mortgage").collect() };
+    let disc = "Estimates from the figures recorded and the rate or quote you gave, not an offer: the lender or insurer gives the binding numbers. No lender, insurer or product is recommended. This is general information, not financial advice.";
+    if sel.is_empty() { return Ok(red.walk(&json!({"as_of": today.to_string(), "country": "BE", "mortgages": [], "note": "No mortgage on file.", "what_i_need": ["a liability of kind mortgage in the memory (principal, rate.nominal, start_date, end_date or term_months)"], "next": "Ask the user for the loan offer or the latest statement and propose the file as a memory proposal; never estimate a figure.", "disclaimer": disc}), None)); }
+    let market = a["market_rate_pct"].as_f64(); let (mut need, mut out) = (vec![], vec![]); let err = |e: anyhow::Error| format!("mortgage_check failed ({})", e.root_cause());
+    for l in sel {
+        let r = rf(&lm, &l.id); let s = loans::compute(l, today); let j = s.to_json(false); let er = loans::early_repayment(l, &s, None, today);
+        if s.status != "computed" { need.push(if s.missing.is_empty() { format!("{r}: {}", s.alternative.clone().unwrap_or_else(|| "no amortization schedule for this kind".into())) } else { format!("{r}: {} (for the amortization schedule)", s.missing.join(", ")) }); }
+        let mut reneg = match market { None => json!({"status": "needs_market_rate", "note": "give market_rate_pct (a current, generic rate for a loan of similar remaining duration, with its source) and market_rate_date; this tool never looks a rate up"}),
+            Some(m) => crate::loans_extra::renegotiate(l, &s, today, m, a["variant"].as_str(), f("bank_fees"), f("guarantee_fees"), f("other_fees"), a["penalty"].as_f64()).map_err(err)? };
+        if l.early_repayment_penalty.is_some() && reneg["status"] == "computed" { if let Some(n) = reneg["notes"].as_array_mut() { n.push("the loan file states an early-repayment clause: give its amount as `penalty` instead of the legal cap".into()); } }
+        let ins = match a["alternative_insurance_monthly"].as_f64() { None => json!({"status": "needs_alternative_quote", "note": "give alternative_insurance_monthly (a dated quote for equivalent cover)", "current_monthly": s.rows.iter().find(|x| !x.made).filter(|x| x.insurance > 0).map(|x| crate::util::money_str(x.insurance)), "delegated": l.insurance.as_ref().and_then(|i| i.delegated)}),
+            Some(x) => crate::loans_extra::insurance(&s, x, f("insurance_fees")).map_err(err)? };
+        for (v, what) in [(&reneg, "the renegotiation estimate"), (&ins, "the insurance estimate")] { if v["status"] == "needs_fields" && s.status == "computed" { need.push(format!("{r}: {} (for {what})", v["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))); } }
+        out.push(json!({"ref": r, "kind": l.kind, "rate": l.rate.as_ref().map(|x| json!({"type": x.ty, "nominal": x.nominal, "monthly_convention": x.monthly_convention.clone().unwrap_or_else(|| "equivalent".into())})),
+            "schedule": {"status": j["status"], "mode": j["mode"], "missing": j["missing"], "approximate": j["approximate"], "payment": j["payment"], "remaining_capital": j["remaining_capital"], "next_due": j["next_due"], "last_due": j["last_due"], "remaining_instalments": j["remaining_instalments"],
+                "remaining_interest": j["remaining_interest"], "by_year": j["by_year"], "payment_check": j["payment_check"], "outstanding_check": j["outstanding_check"], "assumptions": j["assumptions"]},
+            "early_repayment": {"amount": er["amount"], "rule": er["rule"], "legal_basis": er["legal_basis"], "max_indemnity": er["max_indemnity"], "needs": er["needs"], "other_costs": er["other_costs"]}, "renegotiation": reneg, "insurance_switch": ins}));
+    }
+    let mut v = json!({"as_of": today.to_string(), "country": "BE", "mortgages": out, "note": NOTE, "disclaimer": disc});
+    if let Some(m) = market { let mut mr = super::skill_tools::age("market rate", a["market_rate_date"].as_str(), today)?; mr["nominal_pct"] = m.into(); v["market_rate"] = mr; }
+    if !need.is_empty() { v["what_i_need"] = need.into(); v["next"] = "Ask the user, or create the questions with `questions_propose` (liabilities: the loan-N refs above); never estimate a missing figure.".into(); }
+    Ok(red.walk(&v, None))
 }
