@@ -76,7 +76,9 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["household", "users"]) => ok(json!({"users": household::overview(&a.snap()?.ds, &a.con()?)?["users"], "manage": "logins are managed in a terminal (ui_users)"})),
         ("GET", ["household", "audit"]) => { let lim = r.qi("limit", Some(100), 1, 500)?.unwrap(); let con = a.con()?;
             let rows: Vec<Value> = con.prepare("SELECT at, actor, method, path, status FROM audit_log WHERE (?1 IS NULL OR actor=?1) ORDER BY id DESC LIMIT ?2")?.query_map(params![r.q("actor"), lim], |x| Ok(json!({"at": x.get::<_, String>(0)?, "actor": x.get::<_, String>(1)?, "method": x.get::<_, String>(2)?, "path": x.get::<_, String>(3)?, "status": x.get::<_, i64>(4)?})))?.collect::<rusqlite::Result<_>>()?;
-            ok(json!({"requests": rows, "memory": []})) }
+            let mem: Vec<Value> = crate::memstore::Store::new(&a.cfg, "ui").ok().and_then(|st| st.repo().log(None, lim as usize).ok()).unwrap_or_default().into_iter().map(|c| json!({"id": c.id, "date": c.date, "source": c.source.unwrap_or_else(|| "unknown".into()), "subject": c.subject, "files": c.files})).collect();
+            ok(json!({"requests": rows, "memory": mem})) }
+        ("POST", ["transactions", "split", "clear"]) => { let k = body_str(r, "tx_key")?; let n = a.con()?.execute("DELETE FROM tx_splits WHERE tx_key=?", [&k]).map_err(anyhow::Error::from)?; a.touch(); ok(json!({"tx_key": k, "removed": n})) }
         ("GET", ["me"]) => { let u = r.user.clone().unwrap_or_else(super::User::owner); let s = a.snap()?; let m = u.member_id.as_deref().and_then(|m| s.ds.people.get(m)); ok(json!({"user": u.to_json(), "member": m.map(|m| json!({"id": m.id, "name": m.name, "role": m.role}))})) }
         ("GET", ["me", "summary"]) => me_summary(a, r),
         ("GET", ["me", "transactions"]) => me_transactions(a, r),
@@ -154,7 +156,7 @@ fn session(a: &App, r: &Req) -> R {
     let auth = json!({"passkeys": false, "sso": false, "sso_sign_out": null}); let today = a.today().to_string();
     if u.is_child() { return ok(json!({"csrf_token": csrf, "version": env!("CARGO_PKG_VERSION"), "user": u.to_json(), "today": today, "locale": "en-GB", "allow_remote": false, "coach": {"configured": false, "backend": "", "message": ""}, "sync_daily_limit": 0, "enable_banking_configured": false, "memory_history": false, "auth": auth})); }
     ok(json!({"csrf_token": csrf, "version": env!("CARGO_PKG_VERSION"), "user": u.to_json(), "today": today, "locale": "en-GB", "allow_remote": false, "coach": coach_brief(a),
-        "sync_daily_limit": a.cfg.sync_daily_limit, "enable_banking_configured": a.eb_configured(), "memory_history": false, "auth": auth}))
+        "sync_daily_limit": a.cfg.sync_daily_limit, "enable_banking_configured": a.eb_configured(), "memory_history": a.cfg.memory_history, "auth": auth}))
 }
 fn exchange(a: &App, r: &Req) -> R {
     if !a.sec.exchange.take("login") { return Err(ApiErr::new(429, "rate_limited", "too many login attempts: wait a few minutes")); }
@@ -190,7 +192,7 @@ fn filters(a: &App) -> R {
     let groups: BTreeSet<String> = rules(a)?.categories.keys().map(|c| c.split('.').next().unwrap_or(c).to_string()).collect();
     ok(json!({"accounts": accs.iter().map(|a| json!({"uid": a.uid, "label": a.label, "bank": a.bank, "owner": a.owner, "purpose": a.purpose})).collect::<Vec<_>>(), "owners": owners,
         "members": members.iter().map(|m| json!({"id": m.id, "name": m.name, "role": m.role})).collect::<Vec<_>>(), "purposes": ds.accounts.values().filter_map(|a| a.purpose.clone()).collect::<BTreeSet<_>>(),
-        "tags": tags, "sources": sources, "events": [], "groups": groups, "today": ds.today.to_string()}))
+        "tags": tags, "sources": sources, "events": crate::memstore::Store::new(&a.cfg, "ui").map(|st| super::memory_routes::events_list(&st)).unwrap_or_default(), "groups": groups, "today": ds.today.to_string()}))
 }
 
 // ---------------------------------------------------------------- health / connections
@@ -216,7 +218,7 @@ fn health(a: &App, con: &Connection) -> anyhow::Result<Value> {
     let worst = |ls: &mut dyn Iterator<Item = &str>| ls.fold("green", |w, l| if l == "red" || w == "red" { "red" } else if l == "amber" || w == "amber" { "amber" } else { "green" });
     let banks: Vec<Value> = banks.into_values().map(|(mut b, accs)| { let lv = worst(&mut accs.iter().filter(|x| x["excluded"] == false).filter_map(|x| x["level"].as_str())); b["level"] = lv.into(); b["accounts"] = accs.into(); b }).collect();
     let level = worst(&mut banks.iter().filter_map(|b| b["level"].as_str()));
-    Ok(json!({"generated_at": now.to_rfc3339(), "banks": banks, "ok": level == "green", "level": level, "memory": {"errors": 0, "warnings": 0, "info": 0, "by_code": {}}, "last_run": null}))
+    Ok(json!({"generated_at": now.to_rfc3339(), "banks": banks, "ok": level == "green", "level": level, "memory": crate::memstore::Store::new(&a.cfg, "ui").map(|st| super::memory_routes::summary(&super::memory_routes::check(&st))).unwrap_or_else(|_| json!({"errors": 0, "warnings": 0, "info": 0, "by_code": {}, "failed": "error"})), "last_run": super::memory_routes::last_run(&a.cfg.log_dir())}))
 }
 fn conn_account(ac: &accounts::AccountRow) -> Value {
     json!({"uid": ac.uid, "bank": ac.bank, "label": ac.label, "name": ac.name, "iban_last4": accounts::mask_iban(ac.iban.as_deref()), "currency": ac.currency, "owner": ac.owner, "purpose": ac.purpose, "excluded": ac.exclude, "source": ac.source, "session_status": ac.session_status, "needs_review": ac.needs_review, "tx_count": ac.tx_count, "syncs_left_today": null})

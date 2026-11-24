@@ -102,21 +102,46 @@ pub fn route(a: &App, r: &Req, seg: &[&str]) -> Option<R> {
         ("GET", ["memory", "history"]) => (|| { let st = store(a, r)?; ok(json!({"enabled": a.cfg.memory_history, "changes": st.repo().log(r.q("file"), r.qi("limit", Some(50), 1, 500)?.unwrap() as usize).map_err(ApiErr::from)?})) })(),
         ("GET", ["memory", "history", id, "diff"]) => (|| { let st = store(a, r)?; ok(json!({"diff": st.repo().diff(id).map_err(|e| ApiErr::not_found(&e.to_string()))?, "revert_command": format!("finch memory revert {id}")})) })(),
         ("GET", ["memory", "check"]) => (|| { let st = store(a, r)?; let issues = check(&st); ok(json!({"summary": summary(&issues), "issues": issues})) })(),
+        ("GET", ["household"]) => (|| { let st = store(a, r)?; ok(json!({"members": st.items("household.yaml").iter().filter(|m| m["id"].as_str().is_some_and(|i| !i.is_empty())).map(|m| json!({"id": m["id"], "name": m["name"].as_str().or(m["full_name"].as_str()), "role": m["role"].as_str().unwrap_or("adult"), "birth_year": m["birth_year"], "aliases": m["aliases"].as_array().cloned().unwrap_or_default()})).collect::<Vec<_>>()})) })(),
+        ("GET", ["events"]) => (|| ok(json!({"events": events_list(&store(a, r)?)})))(),
+        ("GET", ["contracts"]) => { let m = |x: Option<f64>| x.map(|v| crate::util::money_str(crate::util::to_cents(v))); let y = |v: &Option<serde_yaml::Value>| v.as_ref().map(crate::memstore::jsonify);
+            ok(json!({"contracts": crate::subs::contracts(&a.cfg.memory_dir).iter().map(|c| json!({"id": c.id, "file": c.file, "provider": c.provider, "kind": c.kind, "merchant_match": c.merchant_match, "start_date": c.start_date, "renewal": c.renewal,
+                "billing": c.billing.as_ref().map(|b| json!({"amount": m(b.amount), "period": b.period})), "commitment_end": c.commitment_end, "notice_period_days": c.notice_period_days, "usage": y(&c.usage), "keep": y(&c.keep), "notes": c.notes})).collect::<Vec<_>>()})) }
         ("GET", ["memory", "overview"]) => (|| { let st = store(a, r)?; let issues = check(&st); let qs = questions::listing(&st, Some("open")); let n = |f: &str| st.items(f).len();
             let files: Vec<String> = std::fs::read_dir(&st.root).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str().map(String::from)).filter(|f| !f.starts_with('.') && (f.ends_with(".yaml") || f.ends_with(".md"))).collect();
-            ok(json!({"files": files, "history_enabled": a.cfg.memory_history, "counts": {"members": n("household.yaml"), "events": n("events.yaml"), "liabilities": 0, "contracts": 0, "assets": 0, "annotations": n("categorization.yaml"), "budgets": n("budgets.yaml"), "goals": n("goals.yaml"),
+            ok(json!({"files": files, "history_enabled": a.cfg.memory_history, "counts": {"members": n("household.yaml"), "events": events_list(&st).len(), "liabilities": crate::loans::liabilities(&st.root).0.len(), "contracts": crate::subs::contracts(&st.root).len(), "assets": n("assets.yaml"), "annotations": n("categorization.yaml"), "budgets": n("budgets.yaml"), "goals": n("goals.yaml"),
                 "open_questions": qs.len(), "pending_proposals": proposals::listing(&st, Some("pending")).len()}, "check": summary(&issues)})) })(),
         _ => return None,
     })
 }
-fn check(st: &Store) -> Vec<Value> {
+/// events.yaml merged with the `## id` headings of events.md, by id.
+pub fn events_list(st: &Store) -> Vec<Value> {
+    let mut seen: std::collections::BTreeMap<String, Value> = st.items("events.yaml").into_iter().filter_map(|e| { let id = e["id"].as_str()?.to_string();
+        Some((id.clone(), json!({"id": id, "title": e["title"], "start": e["start"], "end": e["end"], "budget": e["budget"].as_f64().map(|b| crate::util::money_str(crate::util::to_cents(b))), "status": e["status"], "note": e["note"], "source": "events.yaml"}))) }).collect();
+    for c in crate::rs!(r"(?m)^##\s+([a-z0-9][a-z0-9_-]*)\s*$").captures_iter(&st.read_text("events.md")) { seen.entry(c[1].to_string()).or_insert_with(|| json!({"id": &c[1], "title": null, "start": null, "end": null, "budget": null, "status": null, "note": null, "source": "events.md"})); }
+    seen.into_values().collect()
+}
+pub fn check(st: &Store) -> Vec<Value> {
     let mut out = vec![];
     for (f, _) in crate::memstore::FILES { if !st.exists(f) { continue; } match st.validate(f, &st.read_text(f)) { Ok(w) => out.extend(w.into_iter().map(|m| json!({"level": "warning", "code": "check", "file": f, "message": m, "path": "", "line": null, "msg": null}))),
         Err(e) => out.push(json!({"level": "error", "code": "invalid", "file": f, "message": e.to_string(), "path": "", "line": null, "msg": null})) } }
     if questions::md_hand_edited(st) { out.push(json!({"level": "warning", "code": "questions_view", "file": "open-questions.md", "message": "open-questions.md differs from open-questions.yaml (hand edit or out of date)", "path": "", "line": null, "msg": null})); }
     out
 }
-fn summary(issues: &[Value]) -> Value { let n = |l: &str| issues.iter().filter(|i| i["level"] == l).count(); json!({"errors": n("error"), "warnings": n("warning"), "info": n("info"), "by_code": {}}) }
+pub fn summary(issues: &[Value]) -> Value { let n = |l: &str| issues.iter().filter(|i| i["level"] == l).count(); let mut by: std::collections::BTreeMap<String, usize> = Default::default(); for i in issues { *by.entry(i["code"].as_str().unwrap_or("").into()).or_default() += 1; }
+    json!({"errors": n("error"), "warnings": n("warning"), "info": n("info"), "by_code": by}) }
+/// The last scheduled run of the Python-compatible run log (`<data_dir>/logs/runs.jsonl`, rotated files first): steps, statuses and counts only.
+pub fn last_run(log_dir: &std::path::Path) -> Option<Value> {
+    let mut files: Vec<(i64, std::path::PathBuf)> = std::fs::read_dir(log_dir).into_iter().flatten().flatten().filter_map(|e| { let n = e.file_name().to_string_lossy().to_string(); if n == "runs.jsonl" { Some((0, e.path())) } else { n.strip_prefix("runs.jsonl.").and_then(|x| x.parse::<i64>().ok()).map(|x| (-x, e.path())) } }).collect(); files.sort();
+    let mut runs: Vec<(String, Value)> = vec![];
+    for ev in files.iter().filter_map(|(_, p)| std::fs::read_to_string(p).ok()).flat_map(|t| t.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(Value::is_object).collect::<Vec<_>>()) {
+        let id = ev["run"].as_str().unwrap_or("?").to_string(); if !runs.iter().any(|(r, _)| *r == id) { runs.push((id.clone(), json!({"run": id, "started": null, "ended": null, "outcome": "running", "duration_s": null, "exit": null, "steps": []}))); }
+        let r = &mut runs.iter_mut().find(|(x, _)| *x == id).unwrap().1;
+        match ev["event"].as_str() { Some("run_start") => r["started"] = ev["ts"].clone(), Some("step") => r["steps"].as_array_mut().unwrap().push(json!({"step": ev["step"], "status": ev["status"], "ms": ev["ms"], "counts": ev["counts"], "error": ev["error"]})),
+            Some("run_end") => { r["ended"] = ev["ts"].clone(); r["outcome"] = ev["outcome"].clone(); r["exit"] = ev["exit"].clone(); r["duration_s"] = json!((ev["ms"].as_f64().unwrap_or(0.0) / 100.0).round() / 10.0); } _ => {} }
+    }
+    runs.pop().map(|(_, mut r)| { let f = |s: &str| r["steps"].as_array().into_iter().flatten().filter(|x| x["status"] == s).map(|x| x["step"].clone()).collect::<Vec<_>>(); let (fa, wa) = (f("error"), f("warn")); r["failed"] = fa.into(); r["warned"] = wa.into(); r })
+}
 
 fn budget(a: &App, r: &Req) -> R {
     let b = r.json()?; let st = store(a, r)?; let target = b["target"].as_str().unwrap_or("");

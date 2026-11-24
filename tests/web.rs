@@ -120,3 +120,34 @@ fn endpoints() {
     assert_eq!(n, 2, "who changed what is audited (never a payload)");
     let _ = web::API;
 }
+
+fn git_ok() -> bool { std::process::Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) }
+#[test]
+fn memory_lists_and_health() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None); let m = tmp.path().join("memory");
+    std::fs::write(m.join("household.yaml"), "members:\n  - id: zorro\n    name: Zorro Testmans\n    role: adult\n    birth_year: 1980\n    aliases: [ZT]\n  - id: kiki\n    name: Kiki Testmans\n    role: child\n").unwrap();
+    std::fs::write(m.join("events.yaml"), "events:\n  - id: trip-x\n    title: Trip X\n    start: 2025-03-01\n    budget: 500\n").unwrap();
+    std::fs::write(m.join("events.md"), "# Events\n\n## works-y\nsome works\n\n## trip-x\n").unwrap();
+    std::fs::create_dir_all(m.join("contracts")).unwrap(); std::fs::write(m.join("contracts/net.yaml"), "id: net\nprovider: Quuxnet\nkind: telecom\nbilling:\n  amount: 45.5\n  period: monthly\nnotice_period_days: 30\nusage:\n  frequency: daily\n").unwrap();
+    let h = c.get("/api/v1/household"); assert_eq!(h["members"][0]["birth_year"], 1980); assert_eq!(h["members"][0]["aliases"], json!(["ZT"])); assert_eq!(h["members"][1]["role"], "child");
+    let ev = c.get("/api/v1/events")["events"].clone(); assert_eq!(ev, json!([{"id": "trip-x", "title": "Trip X", "start": "2025-03-01", "end": null, "budget": "500.00", "status": null, "note": null, "source": "events.yaml"}, {"id": "works-y", "title": null, "start": null, "end": null, "budget": null, "status": null, "note": null, "source": "events.md"}]));
+    assert_eq!(c.get("/api/v1/meta/filters")["events"].as_array().unwrap().len(), 2);
+    let ct = c.get("/api/v1/contracts"); assert_eq!(ct["contracts"][0]["file"], "contracts/net.yaml"); assert_eq!(ct["contracts"][0]["billing"]["amount"], "45.50"); assert_eq!(ct["contracts"][0]["usage"]["frequency"], "daily");
+    let o = c.get("/api/v1/memory/overview")["counts"].clone(); assert_eq!((o["contracts"].as_i64(), o["events"].as_i64(), o["members"].as_i64(), o["liabilities"].as_i64()), (Some(1), Some(2), Some(2), Some(0)));
+    assert_eq!(c.get("/api/v1/session")["memory_history"], true);
+    // health: the memory check and the last scheduled run (step names, statuses and counts only)
+    std::fs::write(m.join("budgets.yaml"), "budgets: [oops\n").unwrap();
+    let logs = a.cfg.log_dir(); std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("runs.jsonl.1"), "{\"run\": \"r1\", \"event\": \"run_start\", \"ts\": \"2025-05-08T06:00:00\"}\n").unwrap();
+    std::fs::write(logs.join("runs.jsonl"), "{\"run\": \"r2\", \"event\": \"run_start\", \"ts\": \"2025-05-09T06:00:00\"}\nnot json\n{\"run\": \"r2\", \"event\": \"step\", \"step\": \"sync\", \"status\": \"error\", \"ms\": 12, \"counts\": {\"new\": 0}}\n{\"run\": \"r2\", \"event\": \"run_end\", \"ts\": \"2025-05-09T06:00:02\", \"outcome\": \"failed\", \"exit\": 1, \"ms\": 2345}\n").unwrap();
+    let hl = c.get("/api/v1/health"); assert_eq!(hl["memory"]["errors"], 1, "{hl}"); assert_eq!(hl["memory"]["by_code"]["invalid"], 1);
+    assert_eq!((hl["last_run"]["run"].as_str(), hl["last_run"]["outcome"].as_str(), hl["last_run"]["duration_s"].as_f64()), (Some("r2"), Some("failed"), Some(2.3))); assert_eq!(hl["last_run"]["failed"], json!(["sync"]));
+    std::fs::write(m.join("budgets.yaml"), "budgets: []\n").unwrap();
+    // removing a split; the audit lists the memory history with its source
+    let key = c.get("/api/v1/transactions?q=colruyt&limit=1")["items"][0]["tx_key"].as_str().unwrap().to_string();
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO tx_splits(tx_key, amount, category) VALUES (?1, -100, 'food.groceries'), (?1, -20.5, 'shopping.other')", [&key]).unwrap();
+    let (s, v) = c.call("POST", "/api/v1/transactions/split/clear", Some(json!({"tx_key": key}))); assert_eq!((s, v["removed"].as_i64()), (200, Some(2)), "{v}");
+    assert_eq!(c.call("POST", "/api/v1/transactions/split/clear", Some(json!({}))).0, 422);
+    if git_ok() { assert_eq!(c.call("POST", "/api/v1/goals", Some(json!({"id": "buffer", "target": "1000"}))).0, 200);
+        let au = c.get("/api/v1/household/audit"); assert!(au["memory"].as_array().unwrap().iter().any(|x| x["source"] == "ui" && x["files"] == json!(["goals.yaml"])), "{au}"); }
+}
