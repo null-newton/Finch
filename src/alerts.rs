@@ -4,7 +4,7 @@
 //! OFF by default, go through the egress policy, respect quiet hours and a weekly budget, and say only a minimal, guarded sentence
 //! ("Coach: 2 new alerts (1 high). Open the app."); a summary gives fixed kind labels and rounded amounts. E-mail and the macOS
 //! notification are not ported. Kid budgets and LLM usage stay in the local feed only.
-use crate::{analytics::{recurring::Recurring, Dataset, Scope}, config::Config, ingest::bank, net::Http, util::*};
+use crate::{analytics::{recurring::Recurring, Dataset, Scope}, config::Config, ingest::bank, util::*};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Timelike, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,7 +25,9 @@ fn label(kind: &str) -> &'static str {
 
 #[derive(Debug, Clone)]
 pub struct Settings { pub enabled: bool, pub min_severity: String, pub external_min_severity: String, pub external_detail: String, pub quiet: Option<(u32, u32)>, pub quiet_hours: String, pub max_per_week: i64, pub disabled: Vec<String>, pub digest_only: Vec<String>,
-    pub weekly_digest: bool, pub app_url: String, pub sync_failures: i64, pub anomaly_min_severity: String, pub ntfy: (bool, String), pub telegram: (bool, String), pub email: bool, pub macos: bool }
+    pub weekly_digest: bool, pub app_url: String, pub sync_failures: i64, pub anomaly_min_severity: String, pub ntfy: (bool, String), pub telegram: (bool, String), pub email: Email, pub macos: bool }
+#[derive(Debug, Clone, Default)]
+pub struct Email { pub enabled: bool, pub host: String, pub port: u16, pub tls: String, pub username: String, pub from: String, pub to: String }
 impl Settings {
     /// `[alerts]` of config.toml: every external channel is OFF by default; a wrong value refuses to load.
     pub fn load(cfg: &Config) -> Result<Self> {
@@ -37,14 +39,19 @@ impl Settings {
         let qh = s("quiet_hours", "22:00-08:00"); let quiet = if qh.is_empty() { None } else { let c = crate::rs!(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$").captures(&qh).ok_or_else(|| anyhow::anyhow!("[alerts] quiet_hours must look like \"22:00-08:00\" or be empty"))?;
             let m = |i: usize| c[i].parse::<u32>().unwrap(); Some((m(1) * 60 + m(2), m(3) * 60 + m(4))) };
         let url = nt.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(); if !url.is_empty() && (!url.starts_with("https://") || url::Url::parse(&url).map(|u| !u.username().is_empty() || u.password().is_some()).unwrap_or(true)) { bail!("[alerts.ntfy] url must be an https:// URL without a user name or password"); }
+        let es = |k: &str| em.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string(); let tls = { let t = es("tls"); if t.is_empty() { "starttls".to_string() } else { t.to_lowercase() } };
+        if !["starttls", "ssl"].contains(&tls.as_str()) { bail!("[alerts.email] tls must be starttls or ssl (a plain connection is refused)"); }
+        let port = match em.get("port").and_then(|v| v.as_integer()) { Some(p) if (1..=65535).contains(&p) => p as u16, Some(_) => bail!("[alerts.email] port must be 1-65535"), None => if tls == "ssl" { 465 } else { 587 } };
+        let addr = |k: &str| -> Result<String> { let v = es(k); if !v.is_empty() && !crate::rs!(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$").is_match(&v) { bail!("[alerts.email] {k} is not an e-mail address"); } Ok(v) };
+        let email = Email { enabled: em.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false), host: es("host"), port, tls, username: es("username"), from: addr("from")?, to: addr("to")? };
         let detail = s("external_detail", "minimal"); if !["minimal", "summary"].contains(&detail.as_str()) { bail!("[alerts] external_detail must be minimal or summary"); }
         Ok(Self { enabled: b("enabled", true), min_severity: sev(s("min_severity", "low"), "min_severity")?, external_min_severity: sev(s("external_min_severity", "medium"), "external_min_severity")?, external_detail: detail, quiet, quiet_hours: qh,
             max_per_week: t.get("max_per_week").and_then(|v| v.as_integer()).unwrap_or(7).clamp(0, 100), disabled: kinds("disabled_kinds", &[])?, digest_only: kinds("digest_only_kinds", &["price_increase", "unusual_charge"])?, weekly_digest: b("weekly_digest", true),
             app_url: s("app_url", ""), sync_failures: th.get("sync_failures").and_then(|v| v.as_integer()).unwrap_or(3).max(1), anomaly_min_severity: sev(th.get("anomaly_min_severity").and_then(|v| v.as_str()).unwrap_or("medium").into(), "thresholds.anomaly_min_severity")?,
             ntfy: (nt.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false), url), telegram: (tg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false), tg.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string()),
-            email: em.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false), macos: mc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) })
+            email, macos: mc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) })
     }
-    pub fn enabled(&self, ch: &str) -> bool { match ch { "ntfy" => self.ntfy.0, "telegram" => self.telegram.0, "email" => self.email, "macos" => self.macos, _ => false } }
+    pub fn enabled(&self, ch: &str) -> bool { match ch { "ntfy" => self.ntfy.0, "telegram" => self.telegram.0, "email" => self.email.enabled, "macos" => self.macos, _ => false } }
     pub fn in_quiet(&self, now: DateTime<Utc>) -> bool { let Some((a, b)) = self.quiet else { return false }; let l = now.with_timezone(&chrono::Local); let m = l.hour() * 60 + l.minute(); if a < b { a <= m && m < b } else { m >= a || m < b } }
 }
 
@@ -162,17 +169,26 @@ pub fn compose(ev: &[Value], s: &Settings, guard: &crate::privacy::Guard) -> Opt
 }
 fn secret(n: &str) -> Option<String> { crate::secrets::get_secret(n, false).ok().flatten() }
 pub fn problems(cfg: &Config, s: &Settings, ch: &str) -> Vec<String> {
-    let mut p = vec![]; match ch { "email" => p.push("the e-mail channel is not ported to finch yet".into()), "macos" => p.push("the macOS notification is not ported to finch".into()), _ => {} }
+    let mut p: Vec<String> = vec![]; if ch == "macos" && !cfg!(target_os = "macos") { p.push("the macOS notification works only on a Mac".into()); }
+    if ch == "email" { for (k, v) in [("host", &s.email.host), ("username", &s.email.username), ("from", &s.email.from), ("to", &s.email.to)] { if v.is_empty() { p.push(format!("missing setting: {k}")); } } if secret("smtp_password").is_none() { p.push("secret 'smtp_password' not set".into()); } }
     if let Some(w) = crate::egress::evaluate(cfg, &format!("alerts.{ch}"), "") { p.push(w); }
     if ch == "ntfy" && s.ntfy.1.is_empty() { p.push("missing setting: url".into()); } if ch == "telegram" { if s.telegram.1.is_empty() { p.push("missing setting: chat_id".into()); } if secret("telegram_bot_token").is_none() { p.push("secret 'telegram_bot_token' not set".into()); } } p
 }
 /// The request a send would make, safe to show: tokens are masked.
 pub fn render(s: &Settings, ch: &str, title: &str, body: &str) -> Value {
     match ch { "ntfy" => json!({"channel": ch, "method": "POST", "url": s.ntfy.1, "headers": {"Title": title, "Priority": "default", "Tags": "bell", "Authorization": if secret("ntfy_token").is_some() { "Bearer ********" } else { "(none)" }}, "body": body}),
+        "email" => json!({"channel": ch, "smtp": {"host": s.email.host, "port": s.email.port, "tls": s.email.tls, "username": s.email.username, "password": if secret("smtp_password").is_some() { "********" } else { "(not set)" }}, "from": s.email.from, "to": s.email.to, "subject": title, "body": body}),
+        "macos" => json!({"channel": ch, "argv": macos_argv(title, body), "title": title, "body": body}),
         "telegram" => json!({"channel": ch, "method": "POST", "url": format!("{TELEGRAM_API}/bot********/sendMessage"), "json": {"chat_id": s.telegram.1, "text": format!("{title}\n{body}"), "disable_web_page_preview": true}}), _ => json!({"channel": ch}) }
 }
-fn send(con: &Connection, cfg: &Config, s: &Settings, ch: &str, title: &str, body: &str, http: &dyn Http) -> Result<()> {
+/// A fixed AppleScript; title and body go as argv, never into the script text.
+pub fn macos_argv(title: &str, body: &str) -> Vec<String> { ["osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)", "-e", "end run", if body.is_empty() { title } else { body }, title].iter().map(|x| x.to_string()).collect() }
+fn send(con: &Connection, cfg: &Config, s: &Settings, ch: &str, title: &str, body: &str, t: &crate::net::Transports) -> Result<()> {
+    let http = t.http;
     match ch {
+        "macos" => { crate::egress::allow(Some(con), cfg, "alerts.macos", "localhost", body.len(), "alert")?; let (code, _, _) = t.run.run(&macos_argv(title, body), "", &[("PATH".into(), "/usr/bin:/bin".into())], 10)?; if code != 0 { bail!("the notification command failed"); } }
+        "email" => { let pw = secret("smtp_password").ok_or_else(|| anyhow::anyhow!("smtp_password not set"))?; crate::egress::allow(Some(con), cfg, "alerts.email", &s.email.host.to_lowercase(), body.len(), "alert")?; let e = &s.email;
+            t.smtp.send(&crate::net::Mail { host: &e.host, port: e.port, tls: &e.tls, user: &e.username, from: &e.from, to: &e.to, subject: title, body }, &pw).map_err(|x| anyhow::anyhow!("e-mail not sent: {}", x.to_string().chars().take(60).collect::<String>()))?; }
         "ntfy" => { crate::egress::allow(Some(con), cfg, "alerts.ntfy", &crate::egress::host_of(&s.ntfy.1), body.len(), "alert")?; let mut h = vec![("Title", title.to_string()), ("Priority", "default".to_string()), ("Tags", "bell".to_string())];
             if let Some(t) = secret("ntfy_token") { h.push(("Authorization", format!("Bearer {t}"))); } let r = http.send("POST", &s.ntfy.1, &h, Some(&json!(body)))?; if r.status >= 300 { bail!("ntfy answered {}", r.status); } }
         "telegram" => { let tok = secret("telegram_bot_token").ok_or_else(|| anyhow::anyhow!("telegram_bot_token not set"))?; crate::egress::allow(Some(con), cfg, "alerts.telegram", "api.telegram.org", body.len(), "alert")?;
@@ -181,7 +197,7 @@ fn send(con: &Connection, cfg: &Config, s: &Settings, ch: &str, title: &str, bod
     } Ok(())
 }
 /// Hand each enabled channel the events it has not had yet (dry_run: show what would go, send nothing, write nothing).
-pub fn dispatch(con: &Connection, cfg: &Config, s: &Settings, now: DateTime<Utc>, dry_run: bool, http: &dyn Http) -> Result<Vec<Value>> {
+pub fn dispatch(con: &Connection, cfg: &Config, s: &Settings, now: DateTime<Utc>, dry_run: bool, t: &crate::net::Transports) -> Result<Vec<Value>> {
     let events = listing(con, Some(false))?; let mut out = vec![]; let guard = crate::privacy::Guard::new(cfg, Some(con)); let ts = now_iso(now);
     for ch in CHANNELS.iter().filter(|c| s.enabled(c)) {
         let mut r = json!({"channel": ch, "status": "nothing", "reason": null, "n": 0, "message": null, "request": null});
@@ -198,7 +214,7 @@ pub fn dispatch(con: &Connection, cfg: &Config, s: &Settings, now: DateTime<Utc>
         let Some((title, body, note)) = compose(&pend, s, &guard) else { r["status"] = "failed".into(); r["reason"] = "the message was refused by the privacy filter".into(); out.push(r); continue };
         r["message"] = json!({"title": title, "body": body, "detail": s.external_detail, "note": note}); r["request"] = render(s, ch, &title, &body);
         if dry_run { r["status"] = "would_send".into(); out.push(r); continue; }
-        match send(con, cfg, s, ch, &title, &body, http) {
+        match send(con, cfg, s, ch, &title, &body, t) {
             Err(e) => { con.execute("INSERT INTO alert_deliveries(sent_at, channel, what, n_events, ok, error) VALUES (?,?,'alert',?,0,?)", params![ts, ch, pend.len() as i64, "send failed"])?; r["status"] = "failed".into(); r["reason"] = e.root_cause().to_string().chars().take(120).collect::<String>().into(); }
             Ok(()) => { con.execute("INSERT INTO alert_deliveries(sent_at, channel, what, n_events, ok) VALUES (?,?,'alert',?,1)", params![ts, ch, pend.len() as i64])?;
                 for e in &pend { let mut sent = e["channels_sent"].clone(); sent[*ch] = json!({"at": ts, "severity": e["severity"]}); con.execute("UPDATE alert_events SET channels_sent=?, status=CASE WHEN status='new' THEN 'sent' ELSE status END, updated=? WHERE id=?", params![sent.to_string(), ts, e["id"].as_str()])?; }
@@ -210,10 +226,10 @@ pub fn dispatch(con: &Connection, cfg: &Config, s: &Settings, now: DateTime<Utc>
 pub fn channels_view(con: &Connection, cfg: &Config, s: &Settings) -> Result<Value> {
     let since = now_iso(Utc::now() - chrono::Duration::days(7));
     let chs: Vec<Value> = CHANNELS.iter().map(|ch| { let pr = if s.enabled(ch) { problems(cfg, s, ch) } else { vec![] }; let n: i64 = con.query_row("SELECT COUNT(*) FROM alert_deliveries WHERE channel=? AND ok=1 AND sent_at>=?", params![ch, since], |r| r.get(0)).unwrap_or(0);
-        json!({"channel": ch, "enabled": s.enabled(ch), "ready": s.enabled(ch) && pr.is_empty(), "problems": pr, "external": *ch != "macos", "target": match *ch { "ntfy" => if s.ntfy.1.is_empty() { String::new() } else { format!("{}/****", crate::egress::host_of(&s.ntfy.1)) }, "telegram" => if s.telegram.1.is_empty() { String::new() } else { "chat ****".into() }, _ => String::new() }, "sent_last_7_days": n}) }).collect();
+        json!({"channel": ch, "enabled": s.enabled(ch), "ready": s.enabled(ch) && pr.is_empty(), "problems": pr, "external": *ch != "macos", "target": match *ch { "ntfy" => if s.ntfy.1.is_empty() { String::new() } else { format!("{}/****", crate::egress::host_of(&s.ntfy.1)) }, "telegram" => if s.telegram.1.is_empty() { String::new() } else { "chat ****".into() }, "email" => s.email.to.split_once('@').map_or(String::new(), |(u, d)| format!("{}***@{d} ({})", u.chars().next().unwrap_or('*'), s.email.tls)), "macos" => "this Mac (notification centre)".into(), _ => String::new() }, "sent_last_7_days": n}) }).collect();
     let recent: Vec<Value> = con.prepare("SELECT sent_at, channel, what, ok, error FROM alert_deliveries ORDER BY id DESC LIMIT 20")?.query_map([], |r| Ok(json!({"sent_at": r.get::<_, String>(0)?, "channel": r.get::<_, String>(1)?, "what": r.get::<_, String>(2)?, "ok": r.get::<_, i64>(3)? != 0, "error": r.get::<_, Option<String>>(4)?})))?.collect::<rusqlite::Result<_>>()?;
     Ok(json!({"in_app": {"enabled": s.enabled, "note": "the in-app feed keeps every alert; nothing leaves the machine unless a channel is enabled"}, "channels": chs, "external_detail": s.external_detail, "min_severity": s.min_severity, "quiet_hours": s.quiet_hours, "max_per_week": s.max_per_week,
-        "weekly_digest": s.weekly_digest, "weekly_digest_to_channels": false, "recent_deliveries": recent, "how_to_enable": "enable a channel in [alerts.ntfy] / [alerts.telegram] of config.toml; tokens go to the secret store (ntfy_token, telegram_bot_token)"}))
+        "weekly_digest": s.weekly_digest, "weekly_digest_to_channels": false, "recent_deliveries": recent, "how_to_enable": "enable a channel in [alerts.ntfy] / [alerts.telegram] / [alerts.email] / [alerts.macos] of config.toml; tokens go to the secret store (ntfy_token, telegram_bot_token)"}))
 }
 /// The weekly summary of the in-app feed (local, nothing stored or sent).
 pub fn digest(con: &Connection, today: chrono::NaiveDate) -> Result<Value> {

@@ -2,7 +2,7 @@
 name = "finch"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Personal finance coach for one household: local, private, numbers from code (Rust port of ai-finance-coach)"
 license = "MIT"
 publish = false
@@ -50,6 +50,9 @@ thiserror = "2"
 tiny_http = "0.12"
 toml = "0.8"
 ureq = { version = "2", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+pdf-extract = "0.9"
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1"

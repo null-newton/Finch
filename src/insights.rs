@@ -40,3 +40,17 @@ pub fn cards(ds: &Dataset, rec: &Recurring, con: &Connection, sc: &Scope) -> any
     cards.sort_by(|x, y| y["date"].as_str().unwrap_or("").cmp(x["date"].as_str().unwrap_or(""))); cards.sort_by_key(sev);
     Ok((cards, an["dismissed"].as_u64().unwrap_or(0) as usize + dis.len()))
 }
+
+/// The coach's stored answers and digests (newest first): (visible items, hidden count). Snoozed ones come back on their date.
+pub fn coach_items(con: &Connection, today: chrono::NaiveDate, include_hidden: bool) -> anyhow::Result<(Vec<Value>, usize)> {
+    let rows: Vec<Value> = con.prepare("SELECT id, created, kind, title, body, findings, evidence, skill, backend, model, usage_ref, status, snoozed_until, unverified_numbers, suspicious, question FROM insights ORDER BY created DESC LIMIT 200")?
+        .query_map([], |r| { let j = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!([]))) };
+            Ok(json!({"id": r.get::<_, String>(0)?, "created": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "title": r.get::<_, String>(3)?, "body": r.get::<_, String>(4)?, "findings": j(5)?, "evidence": j(6)?, "skill": r.get::<_, Option<String>>(7)?, "backend": r.get::<_, Option<String>>(8)?, "model": r.get::<_, Option<String>>(9)?,
+                "usage_ref": r.get::<_, Option<i64>>(10)?, "status": r.get::<_, String>(11)?, "snoozed_until": r.get::<_, Option<String>>(12)?, "unverified_numbers": j(13)?, "suspicious": r.get::<_, i64>(14)? != 0, "question": r.get::<_, Option<String>>(15)?, "ai_generated": true, "ai_label": "AI-generated: check the figures against the evidence", "ai_label_short": "AI-generated"})) })?.collect::<rusqlite::Result<_>>()?;
+    let visible = |x: &Value| match x["status"].as_str() { Some("dismissed" | "done") => false, Some("snoozed") => x["snoozed_until"].as_str().and_then(crate::util::d).is_none_or(|d| d <= today), _ => true };
+    let n = rows.len(); let items: Vec<Value> = rows.into_iter().filter(|x| include_hidden || visible(x)).collect(); let hidden = n - items.len(); Ok((items, hidden))
+}
+pub fn coach_set(con: &Connection, id: &str, action: &str, days: i64, today: chrono::NaiveDate) -> anyhow::Result<bool> {
+    let (st, until) = match action { "read" => ("read", None), "done" => ("done", None), "dismiss" => ("dismissed", None), "snooze" => ("snoozed", Some((today + chrono::Duration::days(days.clamp(1, 365))).to_string())), _ => anyhow::bail!("unknown action {action:?}") };
+    Ok(con.execute("UPDATE insights SET status=?, snoozed_until=? WHERE id=?", rusqlite::params![st, until, id])? > 0)
+}

@@ -9,6 +9,7 @@ import { CoachText } from "@/components/CoachText";
 import { useDisclaimers, useGet } from "@/api/hooks";
 import { api, streamSSE } from "@/lib/api";
 import { errorText } from "@/i18n/server";
+import { fmtNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { Compliance, CoachStatus } from "@/api/types";
 
@@ -152,7 +153,7 @@ export default function Coach() {
                       {m.usage && (
                         <Disclosure summary={<span className="text-[12px]">{t("howAnswered")}</span>}>
                           <p className="text-[12px] text-muted" data-testid="coach-usage">
-                            {m.usage.backend} · {m.usage.model} · {t("usage.lookups", { count: m.usage.tool_calls })} · {t("usage.tokens", { in: m.usage.tokens_in.toLocaleString(), out: m.usage.tokens_out.toLocaleString() })}
+                            {m.usage.backend} · {m.usage.model} · {t("usage.lookups", { count: m.usage.tool_calls })} · {t("usage.tokens", { in: fmtNumber(m.usage.tokens_in), out: fmtNumber(m.usage.tokens_out) })}
                             {m.usage.cost_usd ? t("usage.cost", { cost: `$${m.usage.cost_usd.toFixed(4)}` }) + (m.usage.cost_is_estimate ? t(m.usage.backend === "claude-code" ? "usage.estimateNotional" : "usage.estimate") : "") : ""} · {t("usage.seconds", { s: m.usage.duration_s.toFixed(1) })}
                           </p>
                         </Disclosure>

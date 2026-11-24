@@ -70,8 +70,37 @@ pub fn route(a: &App, r: &Req, seg: &[&str]) -> Option<R> {
             let ops = match money(&b, "amount")? { None if !has => return ok(json!({"dry_run": r.qb("dry_run", false), "changed": false, "diff": "", "change_id": null, "warnings": [], "id": m})), None => vec![op("unset", &path, Value::Null)],
                 Some(x) => { let p = b["period"].as_str().filter(|p| ["weekly", "monthly"].contains(p)).ok_or_else(|| ApiErr::new(422, "missing_period", "weekly or monthly"))?; let mut v = json!({"amount": num(x), "period": p}); if let Some(d) = b["day"].as_i64() { v["day"] = d.into(); } vec![op("set", &path, v)] } };
             edit(a, r, "household.yaml", ops, "pocket-money", b["reason"].as_str().map(String::from), m, json!({"id": m})) })(),
+        ("PUT", ["memory", kind @ ("liabilities" | "contracts" | "assets" | "members" | "events"), id]) => item_upsert(a, r, kind, id),
+        ("POST", ["memory", "assets", id, "delete"]) => (|| { let st = store(a, r)?; if !exists_in(&st, "assets.yaml", "assets", id) { return Err(ApiErr::not_found(&format!("no asset {id:?}"))); }
+            let refs: Vec<String> = crate::loans::liabilities(&st.root).0.into_iter().filter(|l| l.asset.as_deref() == Some(*id)).map(|l| format!("loan {}", l.id)).chain(st.items("goals.yaml").into_iter().filter(|g| g["asset"] == *id).map(|g| format!("goal {}", g["id"].as_str().unwrap_or("")))).collect();
+            if !refs.is_empty() { return Err(ApiErr::new(409, "asset_in_use", &format!("asset {id:?} is still used by {}: change those first", refs.join(", ")))); }
+            edit(a, r, "assets.yaml", vec![op("remove", &format!("assets[{id}]"), Value::Null)], "remove-asset", Some(format!("asset {id} removed")), id, json!({"id": id})) })(),
+        ("PUT", ["subs", "contracts", id, "usage"]) => (|| { let b = r.json()?; let rel = format!("contracts/{id}.yaml"); if !store(a, r)?.exists(&rel) { return Err(ApiErr::not_found(&format!("no contract {id:?}"))); }
+            let mut u = Map::new(); u.insert("frequency".into(), json!(b["frequency"].as_str().unwrap_or("unknown"))); if let Some(d) = date(&b, "last_used")? { u.insert("last_used".into(), d.into()); } if let Some(n) = b["note"].as_str().filter(|x| !x.is_empty()) { u.insert("note".into(), n.into()); }
+            edit(a, r, &rel, vec![op("set", "usage", Value::Object(u))], "contract-usage", Some(format!("usage of {id} recorded")), id, json!({"id": id})) })(),
+        ("POST", ["loans", id, "odometer"]) => (|| { let b = r.json()?; let rel = format!("liabilities/{id}.yaml"); let st = store(a, r)?; if !st.exists(&rel) { return Err(ApiErr::not_found("no such loan")); }
+            let km = b["km"].as_i64().or_else(|| b["km"].as_str().and_then(|x| x.parse().ok())).filter(|k| *k >= 0).ok_or_else(|| ApiErr::new(422, "bad_km", "km: a whole number"))?; let dt = date(&b, "date")?.unwrap_or_else(|| a.today().to_string());
+            let has = st.load(&rel).map_err(ApiErr::from)?.get("odometer").is_some_and(|o| o.is_sequence());
+            let ops = if has { vec![op("append", "odometer", json!({"date": dt, "km": km}))] } else { vec![op("set", "odometer", json!([{"date": dt, "km": km}]))] };
+            edit(a, r, &rel, ops, "odometer", Some(format!("odometer {km} km on {dt}")), id, json!({"id": id})) })(),
+        ("POST", ["subs", "decisions"]) => (|| { let b = r.json()?; let rf = b["ref"].as_str().filter(|x| !x.is_empty()).ok_or_else(|| ApiErr::new(422, "missing_ref", "ref: the service of the inventory"))?; let s = a.snap()?; let today = a.today();
+            let inv = crate::subs::inventory(&s.ds, &s.rec, true, today); let row = inv["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == rf || x["contract_id"] == rf).ok_or_else(|| ApiErr::not_found("no such service in the inventory"))?;
+            let rf = row["series_id"].as_str().map(String::from).or(row["contract_id"].as_str().map(|c| format!("ctr_{c}"))).unwrap_or(rf.into()); let pd = |k: &str| date(&b, k).map(|d| d.and_then(|d| crate::util::d(&d)));
+            let v = crate::subs_extra::record_decision(&a.con()?, &rf, row["name"].as_str(), b["decision"].as_str().unwrap_or(""), money(&b, "before_monthly")?.unwrap_or(0.0), money(&b, "after_monthly")?.unwrap_or(0.0), pd("decided_on")?, pd("effective_on")?, b["note"].as_str(), "ui", "confirmed", today, r.qb("dry_run", false)).map_err(|e| ApiErr::new(422, "invalid_decision", &e.to_string()))?;
+            if v["id"].is_string() { a.touch(); } ok(v) })(),
+        ("POST", ["subs", "decisions", id, what @ ("confirm" | "reject")]) => (|| { if !crate::subs_extra::set_decision(&a.con()?, id, what).map_err(ApiErr::from)? { return Err(ApiErr::new(409, "not_proposed", "no proposed decision with that id")); } a.touch(); ok(json!({"id": id, "state": if *what == "confirm" { "confirmed" } else { "rejected" }})) })(),
+        ("POST", ["subs", "alternatives"]) => (|| { let b = r.json()?; let rf = b["ref"].as_str().filter(|x| !x.is_empty()).ok_or_else(|| ApiErr::new(422, "missing_ref", "ref: the service of the inventory"))?;
+            let ret = date(&b, "retrieved_at")?.and_then(|d| crate::util::d(&d)); let id = crate::subs_extra::record_alternative(&a.con()?, rf, b["provider"].as_str().unwrap_or(""), b["offer_name"].as_str().unwrap_or(""), money(&b, "monthly_price")?.unwrap_or(0.0), money(&b, "switching_costs")?.unwrap_or(0.0),
+                b["features"].as_str().filter(|x| !x.is_empty()), b["source_url"].as_str().filter(|x| !x.is_empty()), ret, "manual", "ui", a.today()).map_err(|e| ApiErr::new(422, "invalid_alternative", &e.to_string()))?; a.touch(); ok(json!({"id": id})) })(),
+        ("DELETE", ["subs", "alternatives", id]) => (|| { if !crate::subs_extra::delete_alternative(&a.con()?, id).map_err(ApiErr::from)? { return Err(ApiErr::not_found("no such alternative")); } a.touch(); ok(json!({"id": id, "deleted": true})) })(),
+        ("POST", ["subs", "contracts", "draft"]) => (|| { let b = r.json()?; let sr = b["series"].as_str().ok_or_else(|| ApiErr::new(422, "missing_series", "series: a rec_ id"))?; let s = a.snap()?; let dry = r.qb("dry_run", false);
+            let v = crate::subs_extra::draft(&store(a, r)?, &s.rec, sr, dry).map_err(rej)?; if !dry && v["changed"] == true { a.touch(); } ok(v) })(),
+        ("GET", ["subs", "letter"]) => (|| { let id = r.q("contract").ok_or_else(|| ApiErr::new(422, "missing_contract", "contract: a contract id"))?; let c = crate::subs::contracts(&a.cfg.memory_dir).into_iter().find(|c| c.id == id).ok_or_else(|| ApiErr::not_found("no such contract"))?;
+            let lang = r.q("lang").filter(|l| ["nl", "fr", "en"].contains(l)).unwrap_or("nl"); let ch = r.q("channel").filter(|l| ["letter", "lrar", "email"].contains(l)).unwrap_or("letter"); ok(crate::subs_extra::letter(&store(a, r)?, &c, lang, ch, a.today())) })(),
+        ("GET", ["subs", "contact"]) => (|| ok(crate::subs_extra::contact(&store(a, r)?)))(),
+        ("PUT", ["subs", "contact"]) => (|| { let b = r.json()?; let dry = r.qb("dry_run", false); let res = crate::subs_extra::set_contact(&store(a, r)?, b["address"].as_str(), b["email"].as_str(), b["phone"].as_str(), dry).map_err(rej)?; out(a, &res, dry, json!({})) })(),
         ("GET", ["memory", "history"]) => (|| { let st = store(a, r)?; ok(json!({"enabled": a.cfg.memory_history, "changes": st.repo().log(r.q("file"), r.qi("limit", Some(50), 1, 500)?.unwrap() as usize).map_err(ApiErr::from)?})) })(),
-        ("GET", ["memory", "history", id, "diff"]) => (|| { let st = store(a, r)?; ok(json!({"diff": st.repo().diff(id).map_err(|e| ApiErr::not_found(&e.to_string()))?, "revert_command": format!("uv run coach memory revert {id}")})) })(),
+        ("GET", ["memory", "history", id, "diff"]) => (|| { let st = store(a, r)?; ok(json!({"diff": st.repo().diff(id).map_err(|e| ApiErr::not_found(&e.to_string()))?, "revert_command": format!("finch memory revert {id}")})) })(),
         ("GET", ["memory", "check"]) => (|| { let st = store(a, r)?; let issues = check(&st); ok(json!({"summary": summary(&issues), "issues": issues})) })(),
         ("GET", ["memory", "overview"]) => (|| { let st = store(a, r)?; let issues = check(&st); let qs = questions::listing(&st, Some("open")); let n = |f: &str| st.items(f).len();
             let files: Vec<String> = std::fs::read_dir(&st.root).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str().map(String::from)).filter(|f| !f.starts_with('.') && (f.ends_with(".yaml") || f.ends_with(".md"))).collect();
@@ -138,4 +167,32 @@ pub fn annotate(a: &App, r: &Req, b: &Value) -> R {
             let id = if b["id"].is_string() { base } else { std::iter::once(base.clone()).chain((2..).map(|n| format!("{base}-{n}"))).find(|c| !ids.contains(c)).unwrap() };
             let mut v = Map::new(); v.insert("id".into(), id.clone().into()); v.insert("match".into(), Value::Object(m)); v.extend(ann); (vec![op("append", "annotations", Value::Object(v))], id) } };
     edit(a, r, "categorization.yaml", ops, "annotate", Some(b["reason"].as_str().or(b["note"].as_str()).unwrap_or("annotation from the web app").to_string()), &id.clone(), json!({"id": id, "affected": {"count": null}}))
+}
+
+/// `fields` (nested objects merged field by field) and `unset` on one memory item: a liability or contract file, or an item of
+/// assets / members / events. A new liability or contract file starts from the Python app's template.
+fn item_upsert(a: &App, r: &Req, kind: &str, id: &str) -> R {
+    slug(id)?; let b = r.json()?; let mut fields = b["fields"].as_object().cloned().unwrap_or_default();
+    if fields.get("id").is_some_and(|v| v != id) { return Err(ApiErr::new(422, "id_mismatch", "the id of an item cannot be changed")); } fields.remove("id");
+    let unset: Vec<String> = b["unset"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    fn flat(m: &Map<String, Value>, pre: &str, out: &mut Vec<(String, Value)>) { for (k, v) in m { match v { Value::Object(o) if !o.is_empty() => flat(o, &format!("{pre}{k}."), out), _ => out.push((format!("{pre}{k}"), v.clone())) } } }
+    let st = store(a, r)?; let mut ops = vec![];
+    let rel = if kind == "liabilities" || kind == "contracts" {
+        let rel = format!("{kind}/{id}.yaml");
+        if !st.exists(&rel) { if kind == "liabilities" && fields.get("kind").is_none_or(|k| !k.is_string()) { return Err(ApiErr::new(422, "missing_kind", "a new liability needs a kind (mortgage, car_loan, loa, lld, consumer_loan, bnpl)")); }
+            let mut base = if kind == "liabilities" { json!({"id": id, "kind": null, "lender": null, "asset": null, "start_date": null, "end_date": null, "principal": null, "outstanding": null, "outstanding_as_of": null, "rate": {"type": null, "nominal": null, "taeg": null}, "monthly_payment": null, "payment_match": null, "documents": [], "notes": ""}) }
+                else { json!({"id": id, "provider": null, "kind": null, "merchant_match": null, "renewal": null, "billing": {"amount": null, "period": null}, "notice_period_days": null, "documents": [], "notes": ""}) };
+            for (k, v) in std::mem::take(&mut fields) { match (base.get_mut(&k), v) { (Some(Value::Object(o)), Value::Object(n)) => o.extend(n), (_, v) => { base[&k] = v; } } }
+            ops.push(json!({"op": "create", "value": base})); }
+        let mut f = vec![]; flat(&fields, "", &mut f); ops.extend(f.into_iter().map(|(p, v)| op("set", &p, v))); ops.extend(unset.iter().map(|p| op("unset", p, Value::Null))); rel
+    } else {
+        let (rel, lk) = match kind { "assets" => ("assets.yaml", "assets"), "members" => ("household.yaml", "members"), _ => ("events.yaml", "events") };
+        if !st.exists(rel) { ops.push(json!({"op": "create", "value": {lk: []}})); }
+        if exists_in(&st, rel, lk, id) { let mut f = vec![]; flat(&fields, "", &mut f); ops.extend(f.into_iter().map(|(p, v)| op("set", &format!("{lk}[{id}].{p}"), v))); ops.extend(unset.iter().map(|p| op("unset", &format!("{lk}[{id}].{p}"), Value::Null))); }
+        else { let mut v = Map::new(); v.insert("id".into(), id.into()); v.extend(fields.into_iter().filter(|(_, x)| !x.is_null())); ops.push(op("append", lk, Value::Object(v))); }
+        rel.to_string()
+    };
+    if ops.is_empty() { return Err(ApiErr::new(422, "nothing_to_change", "no field was given")); }
+    let res = st.edit(&rel, &ops, &EditOpts { action: &format!("upsert-{}", kind.trim_end_matches('s')), reason: b["reason"].as_str(), detail: Some(id), dry_run: r.qb("dry_run", false), ..Default::default() }).map_err(rej)?;
+    out(a, &res, r.qb("dry_run", false), json!({"id": id, "file": rel}))
 }

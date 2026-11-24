@@ -5,7 +5,7 @@
 //! 3. Amounts: `fixed` when >= 80 % are within the tolerance of the median (or a few price STEPS), `variable` for bill-like
 //!    categories; a group that does not fit is split into amount clusters, same-day lanes or day-of-month lanes.
 //! 4. >= 3 occurrences (2 for a yearly / quarterly contract-like cadence, low confidence). Ended after 1.5 x the cadence.
-//! Stable ids `rec_` (first payment), carried over from the stored series when they share most payments.
+//!    > Stable ids `rec_` (first payment), carried over from the stored series when they share most payments.
 use super::*;
 use crate::memory::{self, Matcher};
 use chrono::{Datelike, Duration, Weekday};
@@ -222,6 +222,7 @@ pub fn detect(ds: &Dataset, scope: &Scope, include_ended: bool) -> Recurring {
     let mut merged_out = vec![];
     for i in 0..pool.len() {
         let a = pool[i].clone(); let mut merged = false;
+        #[allow(clippy::needless_range_loop)]
         for j in i + 1..pool.len() {
             let b = &pool[j];
             if (&b.direction, &b.account, &b.cadence, &b.category) != (&a.direction, &a.account, &a.cadence, &a.category) { break; }

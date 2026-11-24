@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Phase 3 on synthetic data with FAKE transports (no test reaches the network): Enable Banking connect / sync / reconnect, and the
 //! LLM classifier (redaction, person guard, kNN, usage and egress journals, privacy modes).
 use finch::{classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, bank}, net::{Http, Response, Runner}};
@@ -101,7 +102,7 @@ fn llm_classify_redacts_holds_back_and_stores() {
     let ck: Vec<&str> = c.iter().map(|x| x.key.as_str()).collect(); let hk: Vec<&str> = held.iter().map(|x| x.key.as_str()).collect();
     assert!(ck.contains(&"FRITUUR DE MOLEN") && ck.contains(&"STREAMFLIX COM"), "{ck:?}"); assert!(hk.contains(&"TESTMANS ZORRO"), "the household's own name is never sent: {hk:?} / {ck:?}");
     assert!(!ck.contains(&"PEETERS LOTTE"), "a person transfer is never a candidate");
-    let dry = llm::run(&con, &cfg, &rules, None, &llm::RunOpts { dry_run: true, refresh: false, limit: None, batch: 40, model: None, knn: true }).unwrap();
+    let dry = llm::run(&con, &cfg, &rules, None, &llm::RunOpts { dry_run: true, refresh: false, limit: None, batch: 40, model: None, knn: true, batch_api: false }).unwrap();
     let p = dry.dry_payload.unwrap().to_string(); assert!(!p.contains("TESTMANS") && !p.contains("PEETERS") && !p.contains("Zorro"), "{p}");
     assert_eq!(con.query_row("SELECT COUNT(*) FROM merchants", [], |r| r.get::<_, i64>(0)).unwrap(), 2, "a dry run writes nothing");
 
@@ -109,7 +110,7 @@ fn llm_classify_redacts_holds_back_and_stores() {
     let answer = json!({"results": [{"id": 0, "merchant": "Frituur", "category": "food.fast_food", "confidence": 0.8, "recurring_hint": false}, {"id": 1, "merchant": "Streamflix", "category": "subscriptions.video_streaming", "confidence": 0.9, "recurring_hint": true}]});
     http.on("POST", "/v1/messages", 200, json!({"content": [{"type": "text", "text": answer.to_string()}], "stop_reason": "end_turn", "usage": {"input_tokens": 1500, "output_tokens": 90}}));
     let be = llm::Backend { name: "anthropic-api".into(), cfg: &cfg, con: &con, t: llm::Transport::Http(&http) };
-    let r = llm::run(&con, &cfg, &rules, Some(&be), &llm::RunOpts { dry_run: false, refresh: false, limit: None, batch: 40, model: None, knn: true }).unwrap();
+    let r = llm::run(&con, &cfg, &rules, Some(&be), &llm::RunOpts { dry_run: false, refresh: false, limit: None, batch: 40, model: None, knn: true, batch_api: false }).unwrap();
     assert_eq!(r.knn, 1, "STREAMFLIX COM by similarity"); assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert!(r.labelled >= 1 && r.cost > 0.0, "{r:?}");
     assert!(!http.sent("TESTMANS") && !http.sent("PEETERS") && http.sent("x-api-key"));
@@ -123,7 +124,7 @@ fn llm_classify_redacts_holds_back_and_stores() {
     // local_only: a cloud backend is refused before anything is sent (and the refusal is journalled)
     let mut lo = cfg.clone(); lo.privacy_local_only = true; let be2 = llm::Backend { name: "anthropic-api".into(), cfg: &lo, con: &con, t: llm::Transport::Http(&http) };
     let n0 = http.log.borrow().len();
-    let r = llm::run(&con, &lo, &rules, Some(&be2), &llm::RunOpts { dry_run: false, refresh: true, limit: None, batch: 40, model: None, knn: false }).unwrap();
+    let r = llm::run(&con, &lo, &rules, Some(&be2), &llm::RunOpts { dry_run: false, refresh: true, limit: None, batch: 40, model: None, knn: false, batch_api: false }).unwrap();
     assert!(!r.failed.is_empty() && r.failed[0].contains("egress refused")); assert_eq!(http.log.borrow().len(), n0, "nothing was sent");
 }
 
@@ -133,10 +134,34 @@ fn claude_code_backend_is_isolated() {
     std::env::set_var("COACH_DB_KEY", "must-not-reach-claude");
     let fake = FakeClaude { answer: json!({"results": [{"id": 0, "merchant": "Frituur", "category": "food.fast_food", "confidence": 0.7, "recurring_hint": false}]}), seen: Default::default() };
     let be = llm::Backend { name: "claude-code".into(), cfg: &cfg, con: &con, t: llm::Transport::Run(&fake) };
-    let r = llm::run(&con, &cfg, &rules, Some(&be), &llm::RunOpts { dry_run: false, refresh: false, limit: Some(1), batch: 40, model: None, knn: false }).unwrap();
+    let r = llm::run(&con, &cfg, &rules, Some(&be), &llm::RunOpts { dry_run: false, refresh: false, limit: Some(1), batch: 40, model: None, knn: false, batch_api: false }).unwrap();
     assert_eq!(r.labelled, 1, "{r:?}");
     let seen = fake.seen.borrow(); let (argv, stdin, env) = &seen[0];
     assert!(argv.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()) && argv.iter().any(|a| a.contains("WebFetch")) && argv.contains(&"--disable-slash-commands".to_string()));
     assert!(!env.iter().any(|(k, _)| k == "COACH_DB_KEY" || k == "ANTHROPIC_API_KEY"), "no secret in the claude environment");
     assert!(!stdin.contains("TESTMANS"));
+}
+
+#[test]
+fn anthropic_message_batches_submit_resume_collect() {
+    let (_t, cfg, con) = classify_home(""); let rules = Rules::load(&cfg).unwrap(); let http = FakeHttp::default(); std::env::set_var("ANTHROPIC_API_KEY", "test-key-not-real");
+    http.on("POST", "/v1/messages/batches", 200, json!({"id": "msgbatch_t1", "processing_status": "in_progress"}));
+    let be = llm::Backend { name: "anthropic-api".into(), cfg: &cfg, con: &con, t: llm::Transport::Http(&http) };
+    let o = llm::RunOpts { dry_run: false, refresh: false, limit: None, batch: 40, model: Some("haiku".into()), knn: false, batch_api: true };
+    let r = llm::run(&con, &cfg, &rules, Some(&be), &o).unwrap(); assert_eq!(r.batch, Some(("msgbatch_t1".to_string(), true)), "{r:?}"); assert_eq!(r.labelled, 0, "nothing is stored before the batch ends");
+    let body = http.log.borrow().iter().find(|l| l.1.ends_with("/v1/messages/batches")).unwrap().3.clone().unwrap(); assert_eq!(body["requests"][0]["custom_id"], "j0"); assert_eq!(body["requests"][0]["params"]["model"], "claude-haiku-4-5");
+    assert!(!body.to_string().contains("TESTMANS"), "held-back keys stay out of a batch too");
+    let r2 = llm::run(&con, &cfg, &rules, Some(&be), &o).unwrap(); assert_eq!(r2.batch, Some(("msgbatch_t1".to_string(), false)), "the same jobs are not paid twice");
+    assert_eq!(http.log.borrow().iter().filter(|l| l.0 == "POST").count(), 1);
+    let keys: Vec<String> = serde_json::from_str(&con.query_row("SELECT keys_json FROM llm_batch_jobs WHERE custom_id='j0'", [], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+    http.on("GET", "/v1/messages/batches/msgbatch_t1", 200, json!({"id": "msgbatch_t1", "processing_status": "in_progress", "request_counts": {"processing": 1}}));
+    let c = finch::classify::batch::collect(&con, &cfg, &http, &rules).unwrap(); assert_eq!(c[0]["status"], "in_progress");
+    http.on("GET", "/v1/messages/batches/msgbatch_t1", 200, json!({"id": "msgbatch_t1", "processing_status": "ended", "results_url": "https://api.anthropic.com/v1/messages/batches/msgbatch_t1/results"}));
+    let results: Vec<Value> = keys.iter().enumerate().map(|(i, _)| json!({"id": i, "merchant": "Demo", "category": "food.fast_food", "confidence": 0.8, "recurring_hint": false})).collect();
+    let line = json!({"custom_id": "j0", "result": {"type": "succeeded", "message": {"content": [{"type": "text", "text": json!({"results": results}).to_string()}], "usage": {"input_tokens": 1000, "output_tokens": 50}}}}).to_string();
+    http.routes.borrow_mut().push(("GET".into(), "/v1/messages/batches/msgbatch_t1/results".into(), vec![Response { status: 200, body: format!("{line}\n") }], None));
+    let c = finch::classify::batch::collect(&con, &cfg, &http, &rules).unwrap(); assert_eq!(c[0]["status"], "ended"); assert_eq!(c[0]["labelled"].as_u64().unwrap() as usize, keys.len(), "{c:?}");
+    assert_eq!(con.query_row("SELECT status FROM llm_batches WHERE batch_id='msgbatch_t1'", [], |r| r.get::<_, String>(0)).unwrap(), "done");
+    let cost: f64 = con.query_row("SELECT cost_usd FROM llm_usage WHERE purpose='label'", [], |r| r.get(0)).unwrap(); assert!((cost - 0.000625).abs() < 1e-9, "half the price: {cost}");
+    assert!(finch::classify::batch::collect(&con, &cfg, &http, &rules).unwrap().is_empty(), "nothing left in flight");
 }

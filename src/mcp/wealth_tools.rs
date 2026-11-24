@@ -35,16 +35,45 @@ pub fn rental_overview(ds: &Dataset, red: &Redactor) -> Value {
             "indexation": {"status": ix["status"], "indexed_rent": ix["indexed_rent"], "change": ix["change"], "missing": ix["missing"], "rules": ix["rules"]}, "pnl_this_year": rental::pnl(&cf, chrono::Datelike::year(&ds.today), ds.today)["totals"]}) }).collect();
     red.walk(&json!({"as_of": ds.today.to_string(), "properties": props, "tax": rental::tax(chrono::Datelike::year(&ds.today))["note"], "note": "A property reaches you as asset-N: never an address, a tenant or a lender. Every index or rent is the owner's own figure: never look one up and never estimate a missing one."}), None)
 }
-pub fn subscriptions(ds: &Dataset, rec: &Recurring, red: &Redactor, a: &Value) -> Value {
-    let v = subs::inventory(ds, rec, a["include_ended"].as_bool().unwrap_or(false), ds.today);
+pub fn subscriptions(ds: &Dataset, rec: &Recurring, red: &Redactor, con: &rusqlite::Connection, a: &Value) -> Value {
+    let mut v = subs::inventory(ds, rec, a["include_ended"].as_bool().unwrap_or(false), ds.today); let _ = crate::subs_extra::enrich(&mut v, con, rec, ds.today);
     let rows: Vec<Value> = v["rows"].as_array().into_iter().flatten().map(|r| json!({"ref": r["ref"], "name": r["name"], "group": r["group"], "category": r["category"], "cadence": r["cadence"], "monthly": r["monthly"], "yearly": r["yearly"], "status": r["status"], "last_payment": r["last_payment"], "next_charge": r["next_charge"],
         "price_changes": r["price_changes"], "contract": {"status": r["contract"]["status"], "id": r["contract"]["id"], "renewal": r["contract"]["renewal"], "commitment_end": r["contract"]["commitment_end"]}, "usage": r["usage"]["frequency"],
+        "alternatives": {"count": r["alternatives"]["count"], "outdated": r["alternatives"]["outdated"], "best": r["alternatives"]["best"].get("savings").map(|s| json!({"offer": r["alternatives"]["best"]["label"], "monthly_price": r["alternatives"]["best"]["monthly_price"], "retrieved_at": r["alternatives"]["best"]["retrieved_at"], "net_12m": s["net_12m"]}))}, "decision": r["decision"].get("status").map(|_| json!({"decision": r["decision"]["decision"], "status": r["decision"]["status"]})),
         "cancellation": {"family": r["cancellation"]["family"], "can_cancel_now": r["cancellation"]["can_cancel_now"], "earliest_effective_date": r["cancellation"]["earliest_effective_date"], "send_notice_by": r["cancellation"]["send_notice_by"]}})).collect();
-    red.walk(&json!({"as_of": v["as_of"], "country": "BE", "rows": rows, "groups": v["groups"], "totals": v["totals"], "note": "Recurring costs and their contracts; usage is what the user states (the bank cannot tell). Nothing is ever cancelled: the user decides."}), None)
+    red.walk(&json!({"as_of": v["as_of"], "country": "BE", "rows": rows, "groups": v["groups"], "totals": v["totals"], "savings": v["savings"], "note": "Recurring costs and their contracts; usage is what the user states (the bank cannot tell). Nothing is ever cancelled: the user decides."}), None)
 }
 pub fn cancellability(ds: &Dataset, rec: &Recurring, red: &Redactor, a: &Value) -> Result<Value, String> {
     let r = a["ref"].as_str().unwrap_or(""); let v = subs::inventory(ds, rec, true, ds.today);
     let row = v["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == r || x["contract_id"] == r).ok_or("unknown ref: use a `ref` or contract id from subscriptions_inventory")?;
     let mut c = row["cancellation"].clone(); if let Some(o) = c.as_object_mut() { o.remove("first_request_date"); }
     Ok(red.walk(&json!({"ref": row["ref"], "name": row["name"], "cancellation": c, "contract_on_file": row["contract"]["status"] != "missing"}), None))
+}
+fn row_of(ds: &Dataset, rec: &Recurring, rf: &str) -> Result<Value, String> { subs::inventory(ds, rec, true, ds.today)["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == rf || x["contract_id"] == rf).cloned().ok_or("unknown ref: use a `ref` from subscriptions_inventory".into()) }
+fn canon(row: &Value) -> String { row["series_id"].as_str().map(String::from).or(row["contract_id"].as_str().map(|c| format!("ctr_{c}"))).unwrap_or_default() }
+/// Stores an offer found on the web (https source, the date it was seen); finch computes the savings.
+pub fn alternatives_record(ds: &Dataset, rec: &Recurring, red: &Redactor, con: &rusqlite::Connection, a: &Value) -> Result<Value, String> {
+    let row = row_of(ds, rec, a["ref"].as_str().unwrap_or(""))?; let ret = a["retrieved_at"].as_str().and_then(crate::util::d).ok_or("retrieved_at: the date the price was seen (YYYY-MM-DD)")?;
+    let id = crate::subs_extra::record_alternative(con, &canon(&row), a["provider"].as_str().unwrap_or(""), a["offer_name"].as_str().unwrap_or(""), a["monthly_price"].as_f64().unwrap_or(0.0), a["switching_costs"].as_f64().unwrap_or(0.0), a["features"].as_str(), a["source_url"].as_str(), Some(ret), "find-cheaper", "coach-llm", ds.today).map_err(|e| format!("not recorded: {e}"))?;
+    let alts = crate::subs_extra::alternatives_for(con, row["contract_id"].as_str(), row["series_id"].as_str(), row["monthly"].as_str().and_then(|m| m.parse::<f64>().ok()).map(crate::util::to_cents), ds.today).map_err(|e| e.to_string())?;
+    let me = alts["items"].as_array().into_iter().flatten().find(|x| x["id"] == id.as_str()).cloned().unwrap_or_default();
+    Ok(red.walk(&json!({"id": id, "ref": row["ref"], "savings": me["savings"], "status": me["status"], "note": "stored with its source and date; nothing is switched"}), None))
+}
+/// A decision PROPOSED by the coach: it counts only after the user confirms it in the web app.
+pub fn decision_propose(ds: &Dataset, rec: &Recurring, red: &Redactor, con: &rusqlite::Connection, a: &Value) -> Result<Value, String> {
+    let row = row_of(ds, rec, a["ref"].as_str().unwrap_or(""))?; let eff = a["effective_on"].as_str().map(|v| crate::util::d(v).ok_or("effective_on: YYYY-MM-DD")).transpose()?;
+    let note = a["note"].as_str().map(|n| red.text(n).chars().take(300).collect::<String>()); let before = a["before_monthly"].as_f64().or(row["monthly"].as_str().and_then(|m| m.parse().ok())).unwrap_or(0.0);
+    let v = crate::subs_extra::record_decision(con, &canon(&row), row["name"].as_str(), a["decision"].as_str().unwrap_or(""), before, a["after_monthly"].as_f64().unwrap_or(0.0), None, eff, note.as_deref(), "coach-llm", "proposed", ds.today, false).map_err(|e| format!("not proposed: {e}"))?;
+    Ok(red.walk(&json!({"decision_id": v["id"], "state": "proposed", "monthly_saving": v["monthly_saving"], "next": "Tell the user: they confirm or reject it in the web app (Subscriptions). A saving counts only once the bank data confirms it."}), None))
+}
+pub fn contracts_draft(ds: &Dataset, rec: &Recurring, red: &Redactor, cfg: &crate::config::Config, a: &Value) -> Result<Value, String> {
+    let row = row_of(ds, rec, a["ref"].as_str().unwrap_or(""))?; let s = row["series_id"].as_str().ok_or("draft only from a rec_ series without a contract file")?; if row["contract"]["status"] != "missing" { return Err("that service already has a contract file".into()); }
+    let st = crate::memstore::Store { history: false, ..crate::memstore::Store::new(cfg, "coach-llm").map_err(|e| e.to_string())? };
+    let v = crate::subs_extra::draft_propose(&st, rec, s, "coach-llm").map_err(|e| format!("not drafted: {}", red.text(&e.to_string())))?;
+    Ok(red.walk(&json!({"proposal_id": v["proposal_id"], "status": "pending", "kind": v["contract"]["kind"], "missing": v["contract"]["missing"], "next": "Tell the user the proposal id: they review it in the web app (Memory > Proposals) and accept it themselves with `finch memory accept <id>`."}), None))
+}
+pub fn savings_tracker(rec: &Recurring, red: &Redactor, con: &rusqlite::Connection, today: chrono::NaiveDate) -> Result<Value, String> {
+    let mut v = crate::subs_extra::savings(con, rec, today).map_err(|e| e.to_string())?; if let Some(o) = v.as_object_mut() { o.remove("reminders"); }
+    for d in v["decisions"].as_array_mut().into_iter().flatten() { if let Some(o) = d.as_object_mut() { o.remove("note"); } }
+    Ok(red.walk(&v, None))
 }

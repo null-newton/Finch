@@ -110,10 +110,9 @@ fn row(rf: &str, name: &str, ent: &str, cat: &str, c: Option<&Contract>, src: &s
     json!({"ref": rf, "name": name, "entity": ent, "group": g, "group_label": GROUPS.iter().find(|x| x.0 == g).unwrap().1, "category": (!cat.is_empty()).then_some(cat), "kind": c.and_then(|c| c.kind.clone()).unwrap_or_else(|| "other".into()), "cost_source": src, "cadence": cadence,
         "expected_amount": expected, "monthly": monthly.map(money_str), "yearly": yearly.map(money_str), "status": status, "first_seen": first, "last_payment": last, "next_charge": next, "overdue_days": overdue, "account": account, "price_history": hist, "price_changes": pch,
         "contract": contract, "series_id": (src == "series").then_some(rf), "series": if src == "series" { vec![rf] } else { vec![] }, "contract_id": c.map(|c| c.id.clone()), "linked_series": [], "draftable": c.is_none(), "usage": usage(c),
-        "cancellation": cancellability(c.unwrap_or(&empty), cat, monthly, today), "alternatives": {"count": 0, "current": 0, "outdated": 0, "best": null, "items": [], "note": "alternatives are recorded in the Python app"}, "decision": null, "proposed_decisions": []})
+        "cancellation": cancellability(c.unwrap_or(&empty), cat, monthly, today), "alternatives": {"count": 0, "current": 0, "outdated": 0, "best": null, "items": [], "note": "no alternative recorded"}, "decision": null, "proposed_decisions": []})
 }
 pub fn savings_summary() -> Value { json!({"realised_monthly": "0.00", "realised_since_decisions": "0.00", "realised_yearly_run_rate": "0.00", "verified": 0, "pending": 0, "contradicted": 0, "claimed_monthly_unverified": "0.00"}) }
-pub fn savings_view(today: NaiveDate) -> Value { let mut v = savings_summary(); v["as_of"] = today.to_string().into(); v["decisions"] = json!([]); v["proposed"] = json!([]); v["reminders"] = json!([]); v["note"] = "decisions (cancel / switch / downgrade) and their verified savings are not ported to finch yet".into(); v }
 
 #[cfg(test)]
 mod tests {

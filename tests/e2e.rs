@@ -129,7 +129,7 @@ fn phase2_recurring_prices_anomalies_transfers_forecast() {
     let cal = planning::calendar(&ds, &con, &rec, Some(40), false); assert!(cal["items"].as_array().unwrap().iter().any(|i| i["title"].as_str().is_some_and(|t| t.contains("NETFLIX"))));
 
     let mut s = mcp::Session::with(cfg.clone(), con, today);
-    for (tool, args) in [("recurring", json!({})), ("price_changes", json!({})), ("anomalies", json!({})), ("forecast", json!({"days": 30})), ("budget_status", json!({})), ("budget_suggestions", json!({})), ("calendar", json!({"days": 40})), ("goals", json!({}))] {
+    for (tool, args) in [("recurring", json!({})), ("price_changes", json!({})), ("anomalies", json!({})), ("forecast", json!({"days": 30})), ("budget_status", json!({})), ("budget_suggestions", json!({})), ("calendar", json!({"days": 40})), ("goals", json!({})), ("subscriptions_inventory", json!({})), ("savings_tracker", json!({}))] {
         let r = s.call(tool, &args); assert!(r.ok, "{tool}: {}", r.text);
         for leak in ["Quuxcorp", "QUUXCORP", "imp-zicht", "BE68", "BE12 3456", "BE12ZZZ"] { assert!(!r.text.contains(leak), "{tool} leaked {leak}: {}", r.text); }
     }

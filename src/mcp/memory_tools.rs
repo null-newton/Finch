@@ -36,11 +36,20 @@ pub fn propose(cfg: &Config, red: &Redactor, a: &Value, suspicious: bool) -> Res
 }
 fn red_rev_str(red: &Redactor, s: &str) -> String { reverse(red, &Value::String(s.into())).as_str().unwrap_or(s).to_string() }
 
-pub fn questions_propose(cfg: &Config, red: &Redactor, a: &Value, suspicious: bool, today: chrono::NaiveDate) -> Result<Value, String> {
-    if a["series"].as_array().is_some_and(|x| !x.is_empty()) || a["liabilities"].as_array().is_some_and(|x| !x.is_empty()) { return Err("usage questions about subscriptions and loan fields are not available in finch yet: use `custom` questions".into()); }
-    let custom = a["custom"].as_array().cloned().unwrap_or_default(); if custom.is_empty() { return Err("give at least one `custom` question".into()); }
+pub fn questions_propose(cfg: &Config, red: &Redactor, ds: &crate::analytics::Dataset, a: &Value, suspicious: bool, today: chrono::NaiveDate) -> Result<Value, String> {
+    let custom = a["custom"].as_array().cloned().unwrap_or_default(); let series: Vec<String> = a["series"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect(); let libs: Vec<String> = a["liabilities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    if custom.is_empty() && series.is_empty() && libs.is_empty() { return Err("give at least one of series, liabilities or custom".into()); }
     let st = Store::new(cfg, "coach-llm").map_err(|e| e.to_string())?; let existing = st.items(questions::YAML);
     let keys: Vec<String> = existing.iter().filter_map(|q| q["key"].as_str().map(String::from)).collect(); let (mut qs, mut skipped) = (vec![], 0);
+    if !series.is_empty() { let rec = crate::analytics::recurring::detect(ds, &crate::analytics::Scope::default(), true); let cs = crate::subs::contracts(&cfg.memory_dir);
+        for s in &series { let x = rec.json["series"].as_array().into_iter().flatten().find(|x| x["id"] == s.as_str()).ok_or("unknown series: use a `rec_` id from `recurring` or `subscriptions_inventory`")?; let key = x["key"].as_str().unwrap_or("");
+            let c = cs.iter().find(|c| c.merchant_match.as_deref().and_then(|p| fancy_regex::Regex::new(&format!("(?i){p}")).ok()).is_some_and(|r| r.is_match(key).unwrap_or(false)));
+            let q = crate::qgen::usage_question(x, red.text(key) != key, c.map(|c| c.id.as_str()), today); if keys.contains(&q["key"].as_str().unwrap_or("").to_string()) { skipped += 1; } else { qs.push(q); } } }
+    if !libs.is_empty() { let ls = crate::loans::liabilities(&cfg.memory_dir).0;
+        for r in &libs { let l = r.strip_prefix("loan-").and_then(|n| n.parse::<usize>().ok()).and_then(|n| ls.get(n.wrapping_sub(1))).ok_or("unknown liability: use a loan ref (loan-N) from net_worth or loans_overview")?;
+            let s = crate::loans::compute(l, today); let miss: Vec<String> = s.missing.clone(); if miss.is_empty() { skipped += 1; continue; } let key = format!("fill:loan-schedule:{}", l.id); if keys.contains(&key) { skipped += 1; continue; }
+            qs.push(questions::doc(&json!({"id": crate::qgen::qid("fill", &key), "status": "open", "topic": "Liabilities", "topic_code": "liabilities", "question": format!("Liability {} ({}): to show its amortization schedule I need {}. The loan offer or the latest annual statement has them.", l.id, l.kind, miss.join(", ")),
+                "evidence": {"missing": miss}, "suggested_target": {"file": l.file, "field": miss.join(",")}, "key": key, "origin": "coach", "stake": l.monthly_payment.map(|m| m * 12.0), "created": today.to_string()}))); } }
     for c in &custom {
         let text = red.text(c["question"].as_str().unwrap_or("")).trim().to_string(); let key = format!("custom:{}", &crate::util::sha1_hex(&text.to_lowercase())[..10]);
         if keys.contains(&key) || qs.iter().any(|q: &Value| q["key"] == key.as_str()) { skipped += 1; continue; }

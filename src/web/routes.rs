@@ -41,6 +41,7 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["goals"]) => { let s = a.snap()?; ok(planning::goals(&s.ds)) }
         ("GET", ["subscriptions"]) => subscriptions(a, r),
         ("GET", ["insights"]) => insights(a, r),
+        ("POST", ["insights", id, act @ ("read" | "done" | "dismiss" | "snooze")]) if id.starts_with("cin_") => { let d = r.json()?["days"].as_i64().unwrap_or(7); if !crate::insights::coach_set(&a.con()?, id, act, d, a.today())? { return Err(ApiErr::not_found("no such insight")); } a.touch(); ok(json!({"id": id, "status": act})) }
         ("POST", ["insights", id, "dismiss"]) | ("POST", ["price-changes", id, "dismiss"]) => dismiss(a, id),
         ("GET", ["transactions"]) => tx_list(a, r),
         ("GET", ["transactions", "export.csv"]) => tx_csv(a, r),
@@ -81,13 +82,32 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["me", "transactions"]) => me_transactions(a, r),
         ("GET", ["me", "preferences"]) => { let u = r.user.clone().unwrap_or_else(super::User::owner); ok(json!({"prefs": u.prefs, "allowed": {"locale": ["fr-FR", "en-GB", "it-IT"], "theme": ["system", "light", "dark"], "default_member": null, "landing": ["dashboard", "transactions", "kids"]}, "stored": u.id != "owner"})) }
         ("PUT", ["me", "preferences"]) => put_prefs(a, r),
-        ("GET", ["net-worth"]) => { let s = a.snap()?; ok(crate::loans::net_worth(&s.ds, a.today(), s.ds.settings.asset_stale_months as i32)) }
+        ("GET", ["net-worth"]) => { let s = a.snap()?; let mut v = crate::loans::net_worth(&s.ds, a.today(), s.ds.settings.asset_stale_months as i32); if r.qb("history", false) { v["history"] = json!(crate::loans_extra::history(&a.con()?, r.qi("months", Some(36), 1, 240)?.unwrap())?); } ok(v) }
         ("GET", ["liabilities"]) => { let s = a.snap()?; ok(crate::loans::liabilities_view(&s.ds, a.today())) }
         ("GET", ["loans", id]) => { let s = a.snap()?; crate::loans::loan_detail(&s.ds, id, a.today()).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such loan")) }
         ("GET", ["loans", id, "early-repayment"]) => { let s = a.snap()?; let (ls, _) = crate::loans::liabilities(&s.ds.memory_dir); let l = ls.iter().find(|l| l.id == *id).ok_or_else(|| ApiErr::not_found("no such loan"))?;
             let amt = r.q("amount").map(|x| x.replace(',', ".").parse::<f64>().map(crate::loans::cents).map_err(|_| ApiErr::new(422, "bad_amount", "amount: a number"))).transpose()?; ok(crate::loans::early_repayment(l, &crate::loans::compute(l, a.today()), amt, a.today())) }
-        ("GET", ["subs", "inventory"]) => { let s = a.view(r)?; ok(crate::subs::inventory(&s.ds, &s.rec, r.qb("include_ended", false), a.today())) }
-        ("GET", ["subs", "savings"]) => ok(crate::subs::savings_view(a.today())),
+        ("POST", ["loans", id, "scenario"]) => { let s = a.snap()?; let (ls, _) = crate::loans::liabilities(&s.ds.memory_dir); let l = ls.iter().find(|l| l.id == *id).ok_or_else(|| ApiErr::not_found("no such loan"))?; let b = r.json()?; let sc = crate::loans::compute(l, a.today());
+            let f = |k: &str| b[k].as_f64(); let ty = b["type"].as_str().unwrap_or("prepay");
+            let res = match ty { "prepay" => crate::loans_extra::prepay(l, &sc, a.today(), f("amount").ok_or_else(|| ApiErr::new(422, "missing_field", "amount is required for a prepayment"))?, b["on"].as_str().and_then(d), f("penalty")),
+                "renegotiate" => crate::loans_extra::renegotiate(l, &sc, a.today(), f("new_rate").ok_or_else(|| ApiErr::new(422, "missing_field", "new_rate (the offered rate, %) is required"))?, b["variant"].as_str(), f("bank_fees").unwrap_or(0.0), f("guarantee_fees").unwrap_or(0.0), f("other_fees").unwrap_or(0.0), f("penalty")),
+                _ => crate::loans_extra::insurance(&sc, f("alternative").ok_or_else(|| ApiErr::new(422, "missing_field", "alternative (the other policy's monthly premium) is required"))?, f("fees").unwrap_or(0.0)) }.map_err(|e| ApiErr::new(422, "bad_scenario", &e.to_string()))?;
+            let saved = if b["save"] == true { if res["status"] != "computed" { return Err(ApiErr::new(422, "not_computed", "only a computed scenario can be saved")); } let id = crate::loans_extra::save_insight(&a.con()?, ty, &l.kind, &res)?; a.touch(); Some(id) } else { None };
+            ok(json!({"scenario": ty, "result": res, "saved_insight": saved})) }
+        ("POST", ["loans", id, "infer", "propose"]) => { let s = a.snap()?; let (ls, _) = crate::loans::liabilities(&s.ds.memory_dir); let l = ls.iter().find(|l| l.id == *id).ok_or_else(|| ApiErr::not_found("no such loan"))?; let inf = crate::loans_extra::infer(&s.ds, l);
+            let ops: Vec<Value> = inf["fields"].as_array().into_iter().flatten().filter(|f| f["confidence"] != "low").map(|f| json!({"op": "set", "path": f["field"], "value": f["value"]})).collect(); if ops.is_empty() { return Err(ApiErr::new(409, "nothing_inferred", "nothing could be inferred with enough confidence")); }
+            let st = crate::memstore::Store::new(&a.cfg, "ui").map_err(ApiErr::from)?; let p = crate::proposals::create(&st, &l.file, &ops, "loan facts inferred from the bank payments", "infer", vec![]).map_err(|e| ApiErr::new(409, "proposal_error", &e.to_string()))?; a.touch();
+            ok(json!({"id": p.id, "accept_command": format!("finch memory accept {}", p.id)})) }
+        ("GET", ["net-worth", "history"]) => ok(json!({"history": crate::loans_extra::history(&a.con()?, r.qi("months", Some(36), 1, 240)?.unwrap())?})),
+        ("POST", ["net-worth", "snapshot"]) => { let s = a.snap()?; let v = crate::loans_extra::snapshot(&a.con()?, &s.ds, s.ds.settings.asset_stale_months as i32)?; a.touch(); ok(v) }
+        ("GET", ["gold"]) => { let con = a.con()?; let rules = rules(a)?; let (anns, _) = crate::memory::load_annotations(&a.cfg.memory_dir); let st = r.q("strategy").filter(|x| ["money", "stratified"].contains(x)).unwrap_or("money"); let seed = r.qi("seed", Some(1), 0, i64::MAX)?.unwrap() as u64;
+            let runs = crate::quality::runs(&con, None, 10)?; let latest = runs.iter().find(|x| x["kind"] == "classify").cloned();
+            ok(json!({"counts": crate::quality::counts(&con)?, "latest": latest, "runs": runs, "sample": crate::quality::sample(&con, &rules, &anns, r.qi("n", Some(8), 1, 50)?.unwrap() as usize, st, seed)?, "strategy": st, "seed": seed})) }
+        ("POST", ["gold", "bootstrap"]) => { let con = a.con()?; let (anns, _) = crate::memory::load_annotations(&a.cfg.memory_dir); let v = crate::quality::bootstrap(&con, &rules(a)?, &anns, false)?; a.touch(); ok(v) }
+        ("POST", ["gold", "label"]) => { let b = r.json()?; crate::quality::set_gold(&a.con()?, &rules(a)?, b["tx_key"].as_str().unwrap_or(""), b["category"].as_str().unwrap_or(""), "user", "manual", b["note"].as_str()).map_err(|e| ApiErr::new(422, "invalid_label", &e.to_string()))?; a.touch(); ok(json!({"tx_key": b["tx_key"], "category": b["category"]})) }
+        ("POST", ["eval", "classify"]) => { let v = crate::quality::evaluate(&a.con()?, &a.cfg, &rules(a)?, true).map_err(|e| ApiErr::new(409, "eval_unavailable", &e.to_string()))?; ok(json!({"headline": v["headline"], "regressions": v["regressions"], "pipeline": v["pipeline"]})) }
+        ("GET", ["subs", "inventory"]) => { let s = a.view(r)?; let mut v = crate::subs::inventory(&s.ds, &s.rec, r.qb("include_ended", false), a.today()); crate::subs_extra::enrich(&mut v, &a.con()?, &s.rec, a.today())?; ok(v) }
+        ("GET", ["subs", "savings"]) => { let s = a.snap()?; ok(crate::subs_extra::savings(&a.con()?, &s.rec, a.today())?) }
         ("GET", ["rental", "properties"]) => { let s = a.snap()?; ok(crate::rental::list(&s.ds)) }
         ("GET", ["rental", _, "tax"]) => ok(crate::rental::tax(r.qi("year", Some(chrono::Datelike::year(&a.today()) as i64 - 1), 2000, 2100)?.unwrap() as i32)),
         ("GET", ["rental", id]) => { let s = a.snap()?; crate::rental::detail(&s.ds, id, r.qi("year", None, 2000, 2100)?.map(|y| y as i32)).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such rental property")) }
@@ -133,7 +153,7 @@ fn session(a: &App, r: &Req) -> R {
     let u = r.user.clone().unwrap_or_else(super::User::owner); let csrf = a.sec.csrf(r.cookie.as_deref().unwrap_or(""));
     let auth = json!({"passkeys": false, "sso": false, "sso_sign_out": null}); let today = a.today().to_string();
     if u.is_child() { return ok(json!({"csrf_token": csrf, "version": env!("CARGO_PKG_VERSION"), "user": u.to_json(), "today": today, "locale": "en-GB", "allow_remote": false, "coach": {"configured": false, "backend": "", "message": ""}, "sync_daily_limit": 0, "enable_banking_configured": false, "memory_history": false, "auth": auth})); }
-    ok(json!({"csrf_token": csrf, "version": env!("CARGO_PKG_VERSION"), "user": u.to_json(), "today": today, "locale": "en-GB", "allow_remote": false, "coach": {"configured": false, "backend": a.cfg.coach_backend, "message": NOT_PORTED},
+    ok(json!({"csrf_token": csrf, "version": env!("CARGO_PKG_VERSION"), "user": u.to_json(), "today": today, "locale": "en-GB", "allow_remote": false, "coach": coach_brief(a),
         "sync_daily_limit": a.cfg.sync_daily_limit, "enable_banking_configured": a.eb_configured(), "memory_history": false, "auth": auth}))
 }
 fn exchange(a: &App, r: &Req) -> R {
@@ -396,7 +416,7 @@ fn ics(c: &Value) -> String {
     let mut out = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//finch//calendar//EN\r\nCALSCALE:GREGORIAN\r\n");
     for i in c["items"].as_array().into_iter().flatten() {
         let date = i["date"].as_str().unwrap_or("").replace('-', ""); let title = format!("{}{}", i["title"].as_str().unwrap_or(""), i["amount"].as_str().map(|a| format!(" ({a} EUR)")).unwrap_or_default());
-        out += &format!("BEGIN:VEVENT\r\nUID:{}-{date}@finch\r\nDTSTAMP:{date}T000000Z\r\nDTSTART;VALUE=DATE:{date}\r\nSUMMARY:{}\r\nEND:VEVENT\r\n", sha1_hex(&format!("{}{}", i["ref"], i["title"]))[..12].to_string(), esc(&title));
+        out += &format!("BEGIN:VEVENT\r\nUID:{}-{date}@finch\r\nDTSTAMP:{date}T000000Z\r\nDTSTART;VALUE=DATE:{date}\r\nSUMMARY:{}\r\nEND:VEVENT\r\n", &sha1_hex(&format!("{}{}", i["ref"], i["title"]))[..12], esc(&title));
     }
     out + "END:VCALENDAR\r\n"
 }
@@ -416,10 +436,12 @@ fn subscriptions(a: &App, r: &Req) -> R {
     ok(json!({"as_of": s.ds.today.to_string(), "series": rows, "totals": {"active_monthly": money_str(active.iter().map(|r| cents_of(&r["monthly_cost"])).sum()), "active_yearly": money_str(active.iter().map(|r| cents_of(&r["yearly_cost"])).sum()), "n_active": active.len(), "n_missing_contract": active.iter().filter(|r| r["missing_contract"] == true).count()},
         "by_cadence": s.rec.json["by_cadence"], "coverage": s.rec.json["coverage"]}))
 }
+fn coach_brief(a: &App) -> Value { let st = crate::coach::status(&a.cfg, a.coach.as_ref(), None); json!({"configured": st["configured"], "backend": a.cfg.coach_backend, "message": st["message"]}) }
+fn coach_feed(a: &App) -> Result<Value, ApiErr> { let st = crate::coach::status(&a.cfg, a.coach.as_ref(), None); let (items, hidden) = crate::insights::coach_items(&a.con()?, a.today(), false)?; Ok(json!({"configured": st["configured"], "items": items, "hidden": hidden, "message": st["message"]})) }
 fn insights(a: &App, r: &Req) -> R {
     let s = a.view(r)?; let sc = scope(r, &s.ds)?; let (cards, hidden) = crate::insights::cards(&s.ds, &s.rec, &a.con()?, &sc)?; let mut counts: BTreeMap<String, usize> = BTreeMap::new(); for c in &cards { *counts.entry(c["kind"].as_str().unwrap_or("").into()).or_default() += 1; }
     let al = crate::alerts::summary(&a.con()?).unwrap_or(json!({"open": 0, "high": 0}));
-    ok(json!({"as_of": s.ds.today.to_string(), "cards": cards, "hidden": hidden, "alerts": {"open": al["open"], "high": al["high"]}, "counts": counts, "coach": {"configured": false, "items": [], "hidden": 0, "message": NOT_PORTED}}))
+    ok(json!({"as_of": s.ds.today.to_string(), "cards": cards, "hidden": hidden, "alerts": {"open": al["open"], "high": al["high"]}, "counts": counts, "coach": coach_feed(a)?}))
 }
 fn dismiss(a: &App, id: &str) -> R {
     let con = a.con()?;
@@ -450,7 +472,7 @@ fn select(ds: &Dataset, r: &Req) -> Result<Vec<Tx>, ApiErr> {
         && merchant.as_ref().is_none_or(|m| fold(&format!("{} {} {}", t.entity, t.merchant.as_deref().unwrap_or(""), t.mkey)).contains(m.as_str()))
         && (needles.is_empty() || { let mag = money_str(t.amount_c.abs()); let hay = fold(&format!("{} {} {} {} {} {} {} {mag} {}", t.desc, t.entity, t.merchant.as_deref().unwrap_or(""), t.mkey, t.category, t.event.as_deref().unwrap_or(""), t.tags.iter().cloned().collect::<Vec<_>>().join(" "), mag.replace('.', ","))); needles.iter().all(|n| hay.contains(n.as_str())) })
     }).collect();
-    match r.q("sort").unwrap_or("date_desc") { "date_asc" => out.sort_by(|x, y| (x.date, &x.key).cmp(&(y.date, &y.key))), "amount_desc" => out.sort_by(|x, y| (y.amount_c.abs(), y.date).cmp(&(x.amount_c.abs(), x.date))), "amount_asc" => out.sort_by(|x, y| (x.amount_c.abs(), x.date).cmp(&(y.amount_c.abs(), y.date))),
+    match r.q("sort").unwrap_or("date_desc") { "date_asc" => out.sort_by(|x, y| (x.date, &x.key).cmp(&(y.date, &y.key))), "amount_desc" => out.sort_by(|x, y| (y.amount_c.abs(), y.date).cmp(&(x.amount_c.abs(), x.date))), "amount_asc" => out.sort_by_key(|x| (x.amount_c.abs(), x.date)),
         "date_desc" => out.sort_by(|x, y| (y.date, &y.key).cmp(&(x.date, &x.key))), _ => return Err(ApiErr::new(422, "validation_error", "the request is not valid: sort")) }
     Ok(out)
 }
@@ -552,7 +574,8 @@ fn put_prefs(a: &App, r: &Req) -> R {
 
 /// Ask the coach: the answer streams as server-sent events from a worker thread (one question at a time).
 fn coach_stream(a: &App, r: &Req) -> R {
-    let q = r.json()?["question"].as_str().map(str::trim).filter(|q| !q.is_empty() && q.chars().count() <= 4000).map(String::from).ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: question: 1 to 4000 characters"))?;
+    let b = r.json()?; let skill = b["skill"].as_str().unwrap_or("ask").to_string(); if crate::coach::spec(&skill).is_none() { return Err(ApiErr::new(422, "validation_error", "the request is not valid: skill: unknown")); }
+    let q = b["question"].as_str().map(str::trim).filter(|q| (skill != "ask" || !q.is_empty()) && q.chars().count() <= 4000).map(String::from).ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: question: 1 to 4000 characters"))?;
     let st = crate::coach::status(&a.cfg, a.coach.as_ref(), None); if st["configured"] != true { return Err(ApiErr::new(409, "coach_unavailable", st["message"].as_str().unwrap_or(""))); }
     let id = format!("job_{:08x}", rand::random::<u32>()); let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     { let mut j = a.coach_job.lock().unwrap(); if let Some((cur, _)) = j.as_ref() { return Err(ApiErr::new(409, "coach_busy", &format!("the coach is answering another question ({cur})"))); } *j = Some((id.clone(), cancel.clone())); }
@@ -560,7 +583,7 @@ fn coach_stream(a: &App, r: &Req) -> R {
     let _ = tx.send(sse("meta", &json!({"job_id": id})));
     let (cfg, insecure, sp) = (a.cfg.clone(), a.insecure, a.coach.clone()); let app = a.me.get().and_then(|w| w.upgrade());
     let work = move |a: &App| { let con = a.con().ok(); let mut emit = |ev: &str, d: Value| { let _ = tx.send(sse(ev, &d)); };
-        if let Err(e) = crate::coach::run(&cfg, insecure, &q, sp.as_ref(), cancel, con.as_ref(), &mut emit) { emit("error", json!({"code": "failed", "message": e.root_cause().to_string().chars().take(300).collect::<String>()})); emit("done", json!({})); }
+        if let Err(e) = crate::coach::run_skill(&cfg, insecure, &skill, &q, sp.as_ref(), cancel, con.as_ref(), &mut emit) { emit("error", json!({"code": "failed", "message": e.root_cause().to_string().chars().take(300).collect::<String>()})); emit("done", json!({})); }
         *a.coach_job.lock().unwrap() = None; };
     match app { Some(app) => { std::thread::spawn(move || work(&app)); } None => work(a) }
     let mut resp = Resp::with(200, vec![], "text/event-stream"); resp.stream = Some(rx); Ok(resp.header("X-Accel-Buffering", "no"))

@@ -31,7 +31,7 @@ pub fn fold(s: &str) -> String { strip_nfd(&s.to_lowercase()) }
 /// fold(s) and, per BYTE of the folded text, the byte span in `s` of the char it came from.
 pub fn fold_with_map(s: &str) -> (String, Vec<(usize, usize)>) {
     let (mut out, mut idx) = (String::new(), vec![]);
-    for (i, ch) in s.char_indices() { for c in ch.to_lowercase().collect::<String>().nfd().filter(|c| !is_combining_mark(*c)) { out.push(c); idx.extend(std::iter::repeat((i, i + ch.len_utf8())).take(c.len_utf8())); } }
+    for (i, ch) in s.char_indices() { for c in ch.to_lowercase().collect::<String>().nfd().filter(|c| !is_combining_mark(*c)) { out.push(c); idx.extend(std::iter::repeat_n((i, i + ch.len_utf8()), c.len_utf8())); } }
     (out, idx)
 }
 /// Replace every match of `rx` (written on FOLDED text) in `s`, whatever the case and accents of the original.

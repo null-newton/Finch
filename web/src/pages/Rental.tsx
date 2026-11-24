@@ -61,6 +61,7 @@ export default function Rental() {
               </Card>
             );
           const id = d.properties.some((p) => p.id === sel) ? sel : d.properties[0].id;
+          const schemeDeclared = !!d.properties.find((p) => p.id === id)?.scheme.declared;
           return (
             <div className="grid gap-4">
               {d.properties.length > 1 && (
@@ -75,15 +76,17 @@ export default function Rental() {
                 onChange={setTab}
                 tabs={[
                   { value: "cashflow", label: t("tabs.cashflow") },
-                  { value: "scheme", label: t("tabs.scheme"), badge: d.properties.find((p) => p.id === id)?.scheme.decision_needed ? <Badge tone="warn">{t("tabs.decide")}</Badge> : undefined },
+                  // the scheme commitment and the renegotiate-or-sell indicators belong to a tax-incentive scheme (French Pinel-type):
+                  // shown only when the property declares one; Belgian properties never do
+                  ...(schemeDeclared ? [{ value: "scheme" as TabKey, label: t("tabs.scheme"), badge: d.properties.find((p) => p.id === id)?.scheme.decision_needed ? <Badge tone="warn">{t("tabs.decide")}</Badge> : undefined }] : []),
                   { value: "tax", label: t("tabs.tax") },
-                  { value: "sell", label: t("tabs.sell") },
+                  ...(schemeDeclared ? [{ value: "sell" as TabKey, label: t("tabs.sell") }] : []),
                 ]}
               />
               {tab === "cashflow" && <CashflowTab id={id} />}
-              {tab === "scheme" && <SchemeTab id={id} />}
+              {tab === "scheme" && schemeDeclared && <SchemeTab id={id} />}
               {tab === "tax" && <TaxTab id={id} />}
-              {tab === "sell" && <SellTab id={id} />}
+              {tab === "sell" && schemeDeclared && <SellTab id={id} />}
             </div>
           );
         }}

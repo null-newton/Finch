@@ -1,4 +1,5 @@
 //! finch: a private personal-finance coach for one household (Rust port of ai-finance-coach). Numbers come from code.
+#![allow(clippy::possible_missing_else, clippy::unnecessary_sort_by, clippy::suspicious_else_formatting, clippy::type_complexity, clippy::too_many_arguments, clippy::result_large_err)]
 pub mod util;
 pub mod alerts;
 pub mod analytics;
@@ -7,6 +8,7 @@ pub mod classify;
 pub mod coach;
 pub mod config;
 pub mod db;
+pub mod docs;
 pub mod egress;
 pub mod ingest;
 pub mod memory;
@@ -19,9 +21,13 @@ pub mod privacy;
 pub mod household;
 pub mod insights;
 pub mod loans;
+pub mod loans_extra;
 pub mod subs;
+pub mod subs_extra;
 pub mod memstore;
 pub mod proposals;
+pub mod qgen;
+pub mod quality;
 pub mod questions;
 pub mod rental;
 pub mod web;

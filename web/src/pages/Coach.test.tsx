@@ -61,7 +61,7 @@ describe("ask the coach", () => {
     expect(answer).not.toHaveTextContent(REF);
     expect(screen.getByTestId("unverified")).toHaveTextContent("1 number in this answer could not be traced");
     expect(screen.getByTestId("unverified")).toHaveTextContent("999.99");
-    expect(screen.getByTestId("coach-usage")).toHaveTextContent("1,200 tokens in");
+    expect(screen.getByTestId("coach-usage")).toHaveTextContent(/1\D?200 tokens in/);       // grouped in the app's number locale, never the machine's
     const post = calls.find((c) => c.url === "/api/v1/coach/stream")!;
     expect(JSON.parse(post.init!.body as string)).toEqual({ question: "Why was September high?" });
     expect((post.init!.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");

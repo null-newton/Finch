@@ -13,7 +13,7 @@ use std::{collections::BTreeSet, path::{Path, PathBuf}, process::Command};
 pub const GIT_DIRNAME: &str = ".history.git";
 const EXCLUDES: [&str; 8] = ["/documents/", "/.proposals/", "/.backups/", "/.lock", "/.history.git/", "*.tmp", ".DS_Store", "/.lock.finch"];
 /// (file, list key) of the YAML files finch can edit (validated here); other memory files are edited in the Python app.
-pub const FILES: [(&str, &str); 6] = [("budgets.yaml", "budgets"), ("goals.yaml", "goals"), ("open-questions.yaml", "questions"), ("categorization.yaml", "annotations"), ("household.yaml", "members"), ("events.yaml", "events")];
+pub const FILES: [(&str, &str); 8] = [("documents.yaml", "documents"), ("assets.yaml", "assets"), ("budgets.yaml", "budgets"), ("goals.yaml", "goals"), ("open-questions.yaml", "questions"), ("categorization.yaml", "annotations"), ("household.yaml", "members"), ("events.yaml", "events")];
 const MARKDOWN: [&str; 3] = ["preferences.md", "events.md", "notes.md"];
 pub const QUESTIONS_MD: &str = "open-questions.md";
 
@@ -34,7 +34,10 @@ impl Store {
     }
     pub fn exists(&self, rel: &str) -> bool { self.path(rel).is_ok_and(|p| p.is_file()) }
     pub fn read_text(&self, rel: &str) -> String { std::fs::read_to_string(self.path(rel).unwrap_or_default()).map(|s| s.trim_start_matches('\u{feff}').to_string()).unwrap_or_default() }
-    pub fn list_key(rel: &str) -> Option<&'static str> { FILES.iter().find(|f| f.0 == rel).map(|f| f.1) }
+    /// The list key of a list file; "" for a one-item file (`liabilities/<id>.yaml`, `contracts/<id>.yaml`).
+    pub fn list_key(rel: &str) -> Option<&'static str> { FILES.iter().find(|f| f.0 == rel).map(|f| f.1).or_else(|| Self::single(rel).map(|_| "")) }
+    /// (directory, id) of a one-item file.
+    pub fn single(rel: &str) -> Option<(&str, &str)> { let (d, f) = rel.split_once('/')?; let id = f.strip_suffix(".yaml")?; (["liabilities", "contracts"].contains(&d) && crate::rs!(r"^[a-z0-9][a-z0-9_-]*$").is_match(id)).then_some((d, id)) }
     pub fn editable(rel: &str) -> bool { Self::list_key(rel).is_some() || MARKDOWN.contains(&rel) }
     pub fn load(&self, rel: &str) -> Result<Y> { let t = self.read_text(rel); if t.trim().is_empty() { return Ok(Y::Mapping(Mapping::new())); } serde_yaml::from_str(&t).with_context(|| format!("{rel} is not valid YAML")) }
     /// The items of the list of a file (`budgets`, `questions` ...), as JSON.
@@ -67,6 +70,7 @@ impl Store {
     pub fn validate(&self, rel: &str, text: &str) -> Result<Vec<String>> {
         let v: Y = if text.trim().is_empty() { Y::Mapping(Mapping::new()) } else { serde_yaml::from_str(text).map_err(|e| anyhow!("{rel}: the result is not valid YAML ({e})"))? };
         if !v.is_mapping() { bail!("{rel}: the file must be a mapping"); }
+        if let Some((dir, id)) = Self::single(rel) { return self.validate_single(rel, dir, id, &v); }
         let key = Self::list_key(rel).unwrap(); let list = v.get(key).cloned().unwrap_or(Y::Sequence(vec![]));
         let list = if list.is_null() { Y::Sequence(vec![]) } else { list };
         let items = list.as_sequence().ok_or_else(|| anyhow!("{rel}: {key} must be a list"))?;
@@ -81,6 +85,9 @@ impl Store {
         let date = |d: &Option<String>, w: &str| -> Result<()> { if let Some(d) = d { if crate::util::d(d).filter(|x| x.to_string() == *d).is_none() { bail!("{rel}: {w}: {d:?} is not a date (YYYY-MM-DD)"); } } Ok(()) };
         fn typed<T: serde::de::DeserializeOwned>(rel: &str, key: &str, it: &Y) -> Result<T> { serde_yaml::from_value(it.clone()).map_err(|e| anyhow!("{rel}: {key}[{}]: {e}", it.get("id").and_then(Y::as_str).unwrap_or("?"))) }
         match rel {
+            "documents.yaml" => for it in items { let k = it.get("kind").and_then(Y::as_str).unwrap_or(""); let w = format!("document {}", it.get("id").and_then(Y::as_str).unwrap_or("?"));
+                if !crate::docs::KINDS.contains(&k) { bail!("{rel}: {w}: kind must be one of {}", crate::docs::KINDS.join(", ")); }
+                if !it.get("stored_as").and_then(Y::as_str).is_some_and(|s| crate::rs!(r"^[0-9a-f]{16}\.[a-z0-9]{1,5}$").is_match(s)) { bail!("{rel}: {w}: stored_as must be the hashed file name"); } },
             "budgets.yaml" => for it in items { let b: VBudget = typed(rel, key, it)?; let w = format!("budget {}", b.id);
                 if b.category.is_some() == b.group.is_some() { bail!("{rel}: {w}: give exactly one of category or group"); }
                 if let Some(c) = &b.category { cat(c, &w)?; } if let Some(g) = &b.group { group(g, &w)?; } if !(b.monthly > 0.0 && b.monthly.is_finite()) { bail!("{rel}: {w}: monthly must be a positive amount"); } date(&b.start, &w)?; },
@@ -99,11 +106,15 @@ impl Store {
                 if a.category.is_none() && a.tags.is_empty() && a.event.is_none() { bail!("{rel}: {w}: an annotation needs a category, tags or an event"); }
                 if let Some(c) = &a.category { cat(c, &w)?; } for p in [&a.m.merchant_key, &a.m.description].into_iter().flatten() { if fancy_regex::Regex::new(p).is_err() { bail!("{rel}: {w}: {p:?} is not a valid pattern"); } }
                 if a.m.merchant_key.is_none() && a.m.description.is_none() && a.m.tx_keys.as_ref().is_none_or(|k| k.is_empty()) && a.m.date_from.is_none() { bail!("{rel}: {w}: say which transactions it matches"); } },
+            "assets.yaml" => for it in items { let a: crate::loans::Asset = typed(rel, key, it)?; let w = format!("asset {}", a.id);
+                if !ASSET_KINDS.contains(&a.kind.as_str()) { bail!("{rel}: {w}: kind must be one of {}", ASSET_KINDS.join(", ")); }
+                for x in [a.balance, a.value, a.purchase_price, a.contribution_monthly, a.rent_monthly].into_iter().flatten() { if !x.is_finite() { bail!("{rel}: {w}: amounts must be numbers"); } }
+                date(&a.as_of, &w)?; date(&a.purchase_date, &w)?; if let Some(l) = &a.lease { date(&l.start_date, &w)?; if l.base_index.is_some_and(|x| x <= 0.0) { bail!("{rel}: {w}: lease.base_index must be positive"); } } },
             "events.yaml" => for it in items { let e: VEvent = typed(rel, key, it)?; date(&e.start, &format!("event {}", e.id))?; date(&e.end, &format!("event {}", e.id))?; },
             "household.yaml" => {
                 let members: Vec<crate::household::Member> = items.iter().map(|it| typed(rel, key, it)).collect::<Result<_>>()?;
                 for m in &members { if !["adult", "child"].contains(&m.role.as_str()) { bail!("{rel}: member {}: role must be adult or child", m.id); } if m.name.trim().is_empty() { bail!("{rel}: member {}: name is required", m.id); }
-                    if let Some(p) = &m.pocket_money { if !(p.amount > 0.0) || !["weekly", "monthly"].contains(&p.period.as_str()) { bail!("{rel}: member {}: pocket_money needs a positive amount and weekly / monthly", m.id); } if m.role != "child" { warn.push(format!("member {}: pocket money is meant for a child", m.id)); } } }
+                    if let Some(p) = &m.pocket_money { if (p.amount <= 0.0 || p.amount.is_nan()) || !["weekly", "monthly"].contains(&p.period.as_str()) { bail!("{rel}: member {}: pocket_money needs a positive amount and weekly / monthly", m.id); } if m.role != "child" { warn.push(format!("member {}: pocket money is meant for a child", m.id)); } } }
                 let known = |x: &str| x == crate::household::JOINT || members.iter().any(|m| m.id == x);
                 for (k, f) in [("attribution", 0), ("kid_budgets", 1), ("allocations", 2)] {
                     let l = v.get(k).cloned().unwrap_or(Y::Null); if l.is_null() { continue; } let l = l.as_sequence().ok_or_else(|| anyhow!("{rel}: {k} must be a list"))?; let mut seen = BTreeSet::new();
@@ -114,7 +125,7 @@ impl Store {
                                 for p in [&r.m.merchant_key, &r.m.description].into_iter().flatten() { if regex::Regex::new(p).is_err() { bail!("{rel}: attribution {}: {p:?} is not a valid pattern", r.id); } }
                                 if r.m.direction.as_deref().is_some_and(|d| d != "in" && d != "out") { bail!("{rel}: attribution {}: direction is in or out", r.id); } }
                             1 => { let b: crate::household::KidBudget = typed(rel, k, it)?; if !members.iter().any(|m| m.id == b.member) { bail!("{rel}: kid budget {}: {:?} is not a member", b.id, b.member); }
-                                if !["weekly", "monthly"].contains(&b.period.as_str()) || !(b.limit > 0.0) { bail!("{rel}: kid budget {}: a weekly / monthly period and a positive limit", b.id); }
+                                if !["weekly", "monthly"].contains(&b.period.as_str()) || (b.limit <= 0.0 || b.limit.is_nan()) { bail!("{rel}: kid budget {}: a weekly / monthly period and a positive limit", b.id); }
                                 if let Some(c) = &b.category { cat(c, &format!("kid budget {}", b.id))?; } if let Some(g) = &b.group { group(g, &format!("kid budget {}", b.id))?; } }
                             _ => { let a: crate::household::Allocation = typed(rel, k, it)?; if !["equal", "income", "custom"].contains(&a.method.as_str()) { bail!("{rel}: allocation {}: method is equal, income or custom", a.id); }
                                 if serde_json::to_value(&a.m).ok().and_then(|m| m.as_object().map(|o| o.is_empty())).unwrap_or(true) { bail!("{rel}: allocation {}: an allocation needs at least one of category, group, tag, merchant_key, account", a.id); }
@@ -127,6 +138,30 @@ impl Store {
             _ => {}
         }
         Ok(warn)
+    }
+}
+pub const ASSET_KINDS: [&str; 12] = ["regulated_savings", "savings_account", "employee_savings_plan", "life_insurance_savings", "vehicle", "real_estate", "real_estate_rental", "securities", "pension", "cash", "crypto", "other"];
+pub const LIABILITY_KINDS: [&str; 6] = ["mortgage", "car_loan", "loa", "lld", "consumer_loan", "bnpl"];
+pub const CONTRACT_KINDS: [&str; 12] = ["energy", "telecom", "insurance_home", "insurance_car", "insurance_health", "health", "streaming", "software", "membership", "insurance_other", "water", "other"];
+impl Store {
+    fn validate_single(&self, rel: &str, dir: &str, id: &str, v: &Y) -> Result<Vec<String>> {
+        let date = |d: &Option<String>, w: &str| -> Result<()> { if let Some(d) = d { if crate::util::d(d).filter(|x| x.to_string() == *d).is_none() { bail!("{rel}: {w}: {d:?} is not a date (YYYY-MM-DD)"); } } Ok(()) };
+        let rx = |p: &Option<String>, w: &str| -> Result<()> { if let Some(p) = p { if fancy_regex::Regex::new(p).is_err() { bail!("{rel}: {w} is not a valid pattern"); } } Ok(()) };
+        if v.get("id").and_then(Y::as_str) != Some(id) { bail!("{rel}: id must be {id:?} (the file name)"); }
+        if dir == "liabilities" { let l: crate::loans::Liability = serde_yaml::from_value(v.clone()).map_err(|e| anyhow!("{rel}: {e}"))?;
+            if !LIABILITY_KINDS.contains(&l.kind.as_str()) { bail!("{rel}: kind must be one of {}", LIABILITY_KINDS.join(", ")); }
+            if l.rate.as_ref().and_then(|r| r.nominal).is_some_and(|n| !(0.0..=60.0).contains(&n)) { bail!("{rel}: rate.nominal must be between 0 and 60 (%)"); }
+            if l.rate.as_ref().and_then(|r| r.monthly_convention.as_deref()).is_some_and(|c| c != "equivalent" && c != "proportional") { bail!("{rel}: rate.monthly_convention is equivalent or proportional"); }
+            for x in [l.principal, l.outstanding, l.monthly_payment].into_iter().flatten() { if x < 0.0 || !x.is_finite() { bail!("{rel}: amounts must not be negative"); } }
+            if l.term_months.is_some_and(|t| !(1..=600).contains(&t)) { bail!("{rel}: term_months must be 1 to 600"); }
+            for (d, w) in [(&l.start_date, "start_date"), (&l.end_date, "end_date"), (&l.first_payment_date, "first_payment_date"), (&l.outstanding_as_of, "outstanding_as_of")] { date(d, w)?; } rx(&l.payment_match, "payment_match")?;
+            if let Some(Y::Sequence(o)) = v.get("odometer") { let mut last = -1i64; for x in o { let km = x.get("km").and_then(Y::as_i64).ok_or_else(|| anyhow!("{rel}: odometer: km is required"))?; date(&x.get("date").and_then(Y::as_str).map(String::from), "odometer.date")?; if km < last { bail!("{rel}: odometer readings must not go down"); } last = km; } }
+        } else { let c: crate::subs::Contract = serde_yaml::from_value(v.clone()).map_err(|e| anyhow!("{rel}: {e}"))?;
+            if c.kind.as_ref().is_some_and(|k| !CONTRACT_KINDS.contains(&k.as_str())) { bail!("{rel}: kind must be one of {}", CONTRACT_KINDS.join(", ")); }
+            for (d, w) in [(&c.start_date, "start_date"), (&c.renewal, "renewal"), (&c.commitment_end, "commitment_end")] { date(d, w)?; } rx(&c.merchant_match, "merchant_match")?;
+            if let Some(Y::Mapping(u)) = &c.usage { if u.get("frequency").and_then(Y::as_str).is_some_and(|f| !["daily", "weekly", "monthly", "rarely", "never", "unknown"].contains(&f)) { bail!("{rel}: usage.frequency must be daily, weekly, monthly, rarely, never or unknown"); } }
+        }
+        Ok(vec![])
     }
 }
 #[derive(Deserialize)] #[serde(deny_unknown_fields)] #[allow(dead_code)]
@@ -380,6 +415,25 @@ impl Repo {
         if !crate::rs!(r"^[0-9a-f]{4,40}$").is_match(rf) { bail!("{rf:?} is not a change id"); }
         if !self.git(&["rev-parse", "--verify", "--quiet", &format!("{rf}^{{commit}}")], false)?.status.success() { bail!("unknown change id {rf:?}"); }
         self.out(&["show", "--format=%h %s%n", "--no-color", "--no-ext-diff", "--no-textconv", rf])
+    }
+    /// Undo one recorded change with a new change: hand edits are snapshotted first; a conflict, the first snapshot, or a result
+    /// that fails validation leaves the folder exactly as it was.
+    pub fn revert(&self, store: &Store, rf: &str) -> Result<Option<String>> {
+        if !crate::rs!(r"^[0-9a-f]{4,40}$").is_match(rf) { bail!("{rf:?} is not a change id"); } self.ensure()?;
+        let full = self.out(&["rev-parse", "--verify", "--quiet", &format!("{rf}^{{commit}}")]).map_err(|_| anyhow!("unknown change id {rf:?}"))?.trim().to_string();
+        if self.out(&["rev-list", "--max-parents=0", "HEAD"])?.split_whitespace().any(|r| r == full) { bail!("the first snapshot cannot be reverted (it is the starting point)"); }
+        let _lock = Lock::take(&self.root)?; self.snapshot_external()?; let before = self.out(&["rev-parse", "HEAD"])?.trim().to_string();
+        let files: Vec<String> = self.out(&["show", "--format=", "--name-only", &full])?.lines().filter(|l| !l.is_empty()).map(String::from).collect();
+        let undo = |why: String| -> Result<Option<String>> { let _ = self.git(&["reset", "-q", "--hard", &before], false); bail!(why) };
+        if !self.git(&["revert", "--no-commit", "--no-edit", &full], false)?.status.success() { return undo(format!("cannot revert {rf}: later changes touch the same lines; edit the file instead")); }
+        let bad: Vec<String> = files.iter().filter(|f| Store::list_key(f).is_some() && store.exists(f)).filter_map(|f| store.validate(f, &store.read_text(f)).err().map(|e| e.to_string())).collect();
+        if !bad.is_empty() { return undo(format!("reverting would leave an invalid file, nothing changed: {}", bad.iter().take(3).cloned().collect::<Vec<_>>().join("; "))); }
+        if files.iter().any(|f| f == "open-questions.yaml") && store.exists("open-questions.yaml") { atomic_write(&self.root.join(QUESTIONS_MD), &crate::questions::render_markdown(&store.items("open-questions.yaml")))?; }
+        let subject = self.out(&["log", "-1", "--format=%s", &full])?.trim().to_string(); self.git(&["add", "-A"], true)?;
+        match self.commit(&format!("coach: revert {rf} {}
+
+Source: {}
+Reason: undo '{subject}'", files.join(", "), store.source), false) { Ok(c) => Ok(c), Err(e) => undo(e.to_string()) }
     }
     /// 'accepted' / 'rejected' if the history holds a commit for this proposal id.
     pub fn verdict(&self, pid: &str) -> Option<&'static str> {

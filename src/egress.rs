@@ -7,7 +7,9 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 
 /// (kind, external, local_only behaviour, offline behaviour, redaction mode, default host)
-pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 8] = [
+pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 10] = [
+    ("alerts.email", true, "refused", "refused", "minimal-guarded", "the SMTP server of [alerts.email] host"),
+    ("alerts.macos", false, "allowed", "allowed", "minimal-guarded", "this Mac (notification centre)"),
     ("alerts.ntfy", true, "refused", "refused", "minimal-guarded", "the ntfy server of [alerts.ntfy] url"),
     ("alerts.telegram", true, "refused", "refused", "minimal-guarded", "api.telegram.org"),
     ("enable_banking", true, "allowed", "refused", "none", "api.enablebanking.com"),

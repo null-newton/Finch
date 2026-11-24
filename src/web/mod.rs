@@ -100,7 +100,7 @@ impl App {
         let mt = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
         let wal = PathBuf::from(format!("{}-wal", self.cfg.db_path.display()));
         let mem: u128 = std::fs::read_dir(&self.cfg.memory_dir).map(|r| r.flatten().map(|e| mt(&e.path())).max().unwrap_or(0)).unwrap_or(0);
-        format!("{}:{}:{}:{}:{}", self.gen.load(Ordering::SeqCst), mt(&self.cfg.db_path), mt(&wal), mem, self.today.map_or_else(|| chrono::Local::now().date_naive(), |d| d))
+        format!("{}:{}:{}:{}:{}", self.gen.load(Ordering::SeqCst), mt(&self.cfg.db_path), mt(&wal), mem, self.today.unwrap_or_else(|| chrono::Local::now().date_naive()))
     }
     pub fn snap(&self) -> Result<Arc<Snap>> {
         let key = self.data_key();
@@ -182,7 +182,7 @@ impl App {
     }
 }
 /// The endpoints whose `dry_run=true` really previews (a stray flag on another write gets no lax budget and no audit exemption).
-fn previews(path: &str) -> bool { ["/api/v1/alerts/channels/", "/api/v1/budgets", "/api/v1/goals", "/api/v1/annotations", "/api/v1/transactions/category", "/api/v1/household/", "/api/v1/questions/"].iter().any(|p| path.starts_with(p)) }
+fn previews(path: &str) -> bool { ["/api/v1/alerts/channels/", "/api/v1/memory/", "/api/v1/loans/", "/api/v1/subs/contracts/", "/api/v1/budgets", "/api/v1/goals", "/api/v1/annotations", "/api/v1/transactions/category", "/api/v1/household/", "/api/v1/questions/"].iter().any(|p| path.starts_with(p)) }
 fn mime(ext: &str) -> &'static str {
     match ext { "js" => "text/javascript", "css" => "text/css", "png" => "image/png", "svg" => "image/svg+xml", "ico" => "image/x-icon", "webmanifest" => "application/manifest+json", "json" | "map" => "application/json",
         "woff2" => "font/woff2", "woff" => "font/woff", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp", "xml" => "application/xml", "txt" => "text/plain; charset=utf-8", "html" => "text/html; charset=utf-8", _ => "application/octet-stream" }

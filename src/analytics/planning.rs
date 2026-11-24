@@ -187,7 +187,7 @@ pub fn forecast(ds: &Dataset, rec: &Recurring, scope: &Scope, days: i64, points:
         let mut flags: Vec<String> = vec![]; if !has { flags.push("no_variable_history".into()); }
         match bal { None => flags.push("no_balance".into()), Some(b) if (today - b.as_of).num_days() > s.forecast_balance_stale_days as i64 => flags.push("balance_stale".into()), _ => {} }
         let pts = bal.map(|b| project(today, end, start, b.amount_c, &evs, mean, sigma, s.forecast_band_z)).unwrap_or_default();
-        if bal.is_some() { hh_start += bal.unwrap().amount_c; hh_mean += mean; hh_var += (sigma as f64).powi(2); hh_events.extend(evs.clone()); with_bal.push(pts.clone()); }
+        if let Some(b) = bal { hh_start += b.amount_c; hh_mean += mean; hh_var += (sigma as f64).powi(2); hh_events.extend(evs.clone()); with_bal.push(pts.clone()); }
         accs.push(block(Some(u), &ds.label(u), ds.accounts.get(u), bal.map(|b| b.amount_c), bal.map(|b| b.as_of), bal.map(|b| b.ty.clone()), mean, sigma, &pts, &evs, flags, days, points));
     }
     hh_events.sort_by(|a, b| (a.date, &a.account, &a.rf).cmp(&(b.date, &b.account, &b.rf)));

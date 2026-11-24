@@ -113,7 +113,7 @@ pub fn export(cfg: &Config, con: &Connection, out: Option<PathBuf>, plain: bool,
     if !back.unwrap_or(false) { let _ = std::fs::remove_file(&out); bail!("the written archive failed its check"); } Ok(out)
 }
 pub fn decrypt_export(archive: &Path, to: &Path, k: Option<&str>) -> Result<PathBuf> {
-    let data = decrypt(&std::fs::read(archive)?, &key(k)?, EXPORT_MAGIC)?; let dest = to.join(archive.file_name().unwrap().to_string_lossy().trim_end_matches(".enc").to_string());
+    let data = decrypt(&std::fs::read(archive)?, &key(k)?, EXPORT_MAGIC)?; let dest = to.join(archive.file_name().unwrap().to_string_lossy().trim_end_matches(".enc"));
     if dest.exists() { bail!("{} already exists", dest.display()); } crate::memstore::atomic_write_bytes(&dest, &data)?; Ok(dest)
 }
 

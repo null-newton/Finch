@@ -97,7 +97,7 @@ fn mcp_household_tools_never_name_anyone() {
     assert!(k.data["children"][0]["pocket_money"]["series"][0]["source"].as_str().unwrap().starts_with("adult-"));
     let w = s.call("who_pays", &json!({"months": 3})); assert!(w.ok, "{}", w.text);
     let c = s.call("cashflow", &json!({"member": "adult-1", "months": 3})); assert!(c.ok, "{}", c.text);
-    let t = s.call("transactions_search", &json!({"member": kid})); assert!(t.ok, "{}", t.text); assert_eq!(t.data["total"]["count"].as_i64().or(t.data["count"].as_i64()).unwrap_or(-1) >= 0, true);
+    let t = s.call("transactions_search", &json!({"member": kid})); assert!(t.ok, "{}", t.text); assert!(t.data["total"]["count"].as_i64().or(t.data["count"].as_i64()).unwrap_or(-1) >= 0);
     for o in [&ov, &k, &w, &c, &t] { for l in leaks { assert!(!o.text.contains(l), "{l} leaked: {}", o.text); } }
     assert!(!s.call("cashflow", &json!({"member": "zorro"})).ok, "a real member id is refused");
 }

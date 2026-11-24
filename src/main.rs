@@ -1,4 +1,5 @@
 //! `finch`: the command line. Local output keeps raw values; only the MCP server redacts (it talks to a model).
+#![allow(clippy::possible_missing_else, clippy::unnecessary_sort_by, clippy::suspicious_else_formatting, clippy::type_complexity, clippy::too_many_arguments, clippy::result_large_err)]
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, profiles}, mcp, net, secrets, transfers, web};
@@ -15,6 +16,7 @@ struct Cli {
     #[command(subcommand)] cmd: Cmd,
 }
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Show the effective configuration (never a secret)
     Config,
@@ -74,6 +76,8 @@ enum Cmd {
     /// The year in review (default: the year of the last closed month)
     Review { #[arg(long)] year: Option<i32>, #[command(flatten)] scope: ScopeArgs },
     #[command(subcommand)] Coach(CoachCmd),
+    /// Quality: the gold set and the evaluations (nothing here changes a category)
+    #[command(subcommand)] Eval(EvalCmd),
     /// Net worth: balances + assets - capital still due
     Wealth { #[command(flatten)] out: Out },
     #[command(subcommand)] Loans(LoanCmd),
@@ -107,23 +111,75 @@ enum Cmd {
     Snooze { id: String, #[arg(long, default_value_t = 7)] days: i64 },
     /// The weekly summary of the feed (local)
     Digest }
+#[derive(Subcommand)] enum EvalCmd { #[command(subcommand)] Gold(GoldCmd),
+    /// Score the classifier and the pipeline against the gold set (local, no model)
+    Classify { #[arg(long)] no_store: bool, #[command(flatten)] out: Out },
+    /// Check the coach's stored answers (--offline: local, no model)
+    Coach { #[arg(long)] offline: bool, #[arg(long)] skill: Option<String>, #[arg(long, default_value_t = 200)] limit: usize },
+    /// Compare models on the gold merchants (--dry-run: the plan and the cost; a run needs a terminal and a typed yes)
+    Models { #[arg(long, value_delimiter = ',', default_value = "haiku,sonnet")] models: Vec<String>, #[arg(long, default_value_t = 25)] batch: usize, #[arg(long)] dry_run: bool },
+    /// The evaluation history
+    Runs { #[arg(long)] kind: Option<String>, #[arg(long, default_value_t = 20)] limit: usize } }
+#[derive(Subcommand)] enum GoldCmd { /// Refresh the rows your own decisions support (overrides, splits, annotations, merchant labels)
+    Bootstrap { #[arg(long)] dry_run: bool },
+    /// Transactions worth labelling next
+    Sample { #[arg(long, default_value_t = 20)] n: usize, #[arg(long, default_value = "money")] strategy: String, #[arg(long, default_value_t = 1)] seed: u64 },
+    /// Label a sample at the terminal (a human task: your answers are the truth)
+    Label { #[arg(long, default_value_t = 20)] n: usize, #[arg(long, default_value = "money")] strategy: String },
+    /// Counts by origin
+    List,
+    /// Remove one gold row
+    Remove { tx_key: String } }
 #[derive(Subcommand)] enum CoachCmd { /// Ask the coach a question (Claude Code with finch's redacted finance tools only)
-    Ask { question: String } }
+    Ask { #[arg(default_value = "")] question: String, /// Run a skill: digest-weekly, digest-monthly, subscription-audit, contract-check, mortgage-check
+        #[arg(long)] skill: Option<String> },
+    /// The coach's skills and their tools
+    Skills,
+    /// The coach's stored answers and digests
+    Insights { #[arg(long)] all: bool } }
 #[derive(Subcommand)] enum LoanCmd { /// Every loan with its capital still due
     List,
     /// One loan: the amortization schedule (Belgian equivalent monthly rate unless the file says proportional)
     Show { id: String, #[arg(long)] rows: bool },
     /// The legal maximum indemnity of repaying AMOUNT (EUR) early (all of it when omitted)
-    Repay { id: String, amount: Option<f64> } }
+    Repay { id: String, amount: Option<f64> },
+    /// What-if on the real schedule: --prepay EUR, --rate % (renegotiation) or --insurance EUR/month (another borrower insurance)
+    Scenario { id: String, #[arg(long)] prepay: Option<f64>, #[arg(long)] rate: Option<f64>, #[arg(long)] insurance: Option<f64>, #[arg(long)] external: bool },
+    /// Record today's net worth in the history
+    Snapshot }
 #[derive(Subcommand)] enum SubsCmd { /// Every recurring cost with its contract and Belgian cancellation rule
     Inventory { #[arg(long)] ended: bool, #[command(flatten)] out: Out },
     /// Can this contract (id or series ref) be ended, when and how
-    Cancel { r#ref: String } }
+    Cancel { r#ref: String },
+    /// Record a cheaper offer you found (https source, the date you saw it)
+    Alt { r#ref: String, #[arg(long)] provider: String, #[arg(long)] offer: String, #[arg(long)] price: f64, #[arg(long)] url: Option<String>, #[arg(long)] seen: Option<String>, #[arg(long, default_value_t = 0.0)] switching: f64 },
+    /// Remove a recorded offer
+    AltRm { id: String },
+    /// Record what you decided for a service (cancelled, renegotiated, switched, downgraded, kept)
+    Decide { r#ref: String, decision: String, #[arg(long)] before: Option<f64>, #[arg(long, default_value_t = 0.0)] after: f64, #[arg(long)] effective: Option<String>, #[arg(long)] note: Option<String> },
+    /// Confirm or reject a decision the coach proposed (interactive terminal)
+    Decision { id: String, #[arg(value_parser = ["confirm", "reject"])] action: String },
+    /// Decisions and the savings the bank data verifies
+    Savings,
+    /// A cancellation letter filled from the contract (nothing is sent)
+    Letter { contract: String, #[arg(long, default_value = "nl")] lang: String, #[arg(long, default_value = "letter")] channel: String, #[arg(long)] out: Option<std::path::PathBuf> },
+    /// Show or set the contact block used in letters (local only)
+    Contact { #[arg(long)] address: Option<String>, #[arg(long)] email: Option<String>, #[arg(long)] phone: Option<String>, #[arg(long)] dry_run: bool },
+    /// Draft a contract file from a recurring series (rec_ id)
+    Draft { series: String, #[arg(long)] dry_run: bool } }
 #[derive(Subcommand)] enum RentCmd { /// Rental properties and their last month
     List,
     /// One property: months, yearly totals, rent indexation
     Show { id: String, #[arg(long)] year: Option<i32> } }
-#[derive(Subcommand)] enum MemCmd { /// Pending proposals (or --status all / accepted / rejected)
+#[derive(Subcommand)] enum DocCmd { /// Attach a document (contract, loan offer...) to the memory
+    Add { file: std::path::PathBuf, #[arg(long)] kind: String, #[arg(long)] note: Option<String>, #[arg(long)] dry_run: bool },
+    /// The attached documents
+    List,
+    /// Read a document's facts into a PROPOSAL for a loan, contract or asset (shows the exact redacted request; --send asks the model)
+    Extract { id: String, #[arg(long)] into: String, #[arg(long = "target")] target: String, #[arg(long)] send: bool, #[arg(long, default_value = "sonnet")] model: String } }
+#[derive(Subcommand)] enum MemCmd { /// Documents attached to the memory
+    #[command(subcommand)] Doc(DocCmd),
+    /// Pending proposals (or --status all / accepted / rejected)
     Proposals { #[arg(long, default_value = "pending")] status: String },
     /// One proposal: what it changes, recomputed against the file as it is now
     Show { id: String },
@@ -137,6 +193,8 @@ enum Cmd {
     History { #[arg(long)] file: Option<String>, #[arg(long, default_value_t = 30)] limit: usize },
     /// The patch of one recorded change
     Diff { id: String },
+    /// Undo one recorded change (a new change records it; refused on a conflict or an invalid result)
+    Revert { id: String },
     /// Validate the memory files finch edits
     Check }
 #[derive(Subcommand)] enum QCmd { /// Open questions (or --status answered / dismissed / all)
@@ -146,7 +204,9 @@ enum Cmd {
     /// Record an answer (turning it into memory changes is a separate step)
     Answer { id: String, text: String },
     Dismiss { id: String, #[arg(long)] reason: Option<String> },
-    Reopen { id: String } }
+    Reopen { id: String },
+    /// Questions the data raises (merchants, one-offs, files to complete, usage); --dry-run lists them without adding
+    Generate { #[arg(long)] dry_run: bool, #[arg(long, default_value_t = 300.0)] min_stake: f64, #[arg(long, default_value_t = 2000.0)] big: f64 } }
 #[derive(Subcommand)] enum HhCmd { /// Members, account owners, rules and how many transactions belong to whom
     Overview { #[command(flatten)] out: Out },
     /// The children's money: pocket money, extra top-ups and their source, spending, balance trend
@@ -168,7 +228,10 @@ enum Cmd {
 #[derive(Subcommand)] enum ClsCmd { /// Label the merchants that need it: similarity first, then the LLM (redacted, person-like keys held back)
     Run { /// print the exact redacted requests, send nothing
         #[arg(long)] dry_run: bool, /// ask again for LLM / kNN labels too
-        #[arg(long)] refresh: bool, #[arg(long)] limit: Option<usize>, #[arg(long, default_value_t = 40)] batch: usize, #[arg(long)] model: Option<String>, #[arg(long)] no_knn: bool },
+        #[arg(long)] refresh: bool, #[arg(long)] limit: Option<usize>, #[arg(long, default_value_t = 40)] batch: usize, #[arg(long)] model: Option<String>, #[arg(long)] no_knn: bool, /// send as one Anthropic Message Batch (half price; collect with `finch classify batches`)
+        #[arg(long)] batch_api: bool },
+    /// Check the batches in flight and store the results of the ended ones
+    Batches,
     /// Merchants held back (possible people) and low-confidence labels
     Review { #[command(flatten)] out: Out },
     /// Your own label of a merchant key (always wins)
@@ -242,8 +305,10 @@ fn print_session(info: &Value) {
 fn open_browser(url: &str) -> std::io::Result<std::process::Child> { if cfg!(windows) { std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn() } else if cfg!(target_os = "macos") { std::process::Command::new("open").arg(url).spawn() } else { std::process::Command::new("xdg-open").arg(url).spawn() } }
 fn rate(v: &Value) -> String { v.as_f64().map_or("-".into(), |r| format!("{:.1}%", r * 100.0)) }
 
+/// The CLI runs on a thread with a 64 MB stack: the command dispatch is too large for Windows' 1 MB main thread in debug builds.
 fn main() {
-    if let Err(e) = run() { eprintln!("finch: {e:#}"); std::process::exit(1); }
+    let r = std::thread::Builder::new().stack_size(64 << 20).spawn(run).expect("cannot start the main thread").join();
+    match r { Ok(Ok(())) => {} Ok(Err(e)) => { eprintln!("finch: {e:#}"); std::process::exit(1); } Err(_) => std::process::exit(101) }
 }
 fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -288,7 +353,7 @@ fn run() -> Result<()> {
         Cmd::Recurring { refresh, active, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
             if refresh { println!("{}", recurring::refresh(&con, &ds)?); return Ok(()); }
             let r = recurring::detect(&ds, &scope(&sc), !active); if out.json { print_json(&r.json); return Ok(()); }
-            println!("{:<15}{:<7}{:<11}{:<34}{:>11}{:>11}  {:<11}{}", "id", "status", "cadence", "entity", "amount", "per year", "next", "category");
+            println!("{:<15}{:<7}{:<11}{:<34}{:>11}{:>11}  {:<11}category", "id", "status", "cadence", "entity", "amount", "per year", "next");
             for x in &r.series { println!("{:<15}{:<7}{:<11}{:<34}{:>11}{:>11}  {:<11}{}", x.id, x.status, x.cadence, finch::util::truncate_chars(&x.entity, 33), finch::util::money_str(x.expected_c), finch::util::money_str(x.yearly_c), x.next_expected.map_or("-".into(), |d| d.to_string()), x.category); }
             notes(&r.json); }
         Cmd::PriceChanges { since, confirmed, scope: sc, out } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &scope(&sc), true);
@@ -309,16 +374,18 @@ fn run() -> Result<()> {
         Cmd::Accounts(AccCmd::Merge { old, new }) => println!("merged into {}", bank::merge_accounts(&open(true)?, &old, &new)?),
         Cmd::Classify(c) => { let con = open(true)?; let rules = Rules::load(&cfg)?;
             match c {
-                ClsCmd::Run { dry_run, refresh, limit, batch, model, no_knn } => {
+                ClsCmd::Run { dry_run, refresh, limit, batch, model, no_knn, batch_api } => {
                     let (http, runner) = (net::UreqHttp::new(600), net::ProcessRunner);
                     let be = (!dry_run).then(|| llm::Backend { name: cfg.llm_backend.clone(), cfg: &cfg, con: &con, t: if cfg.llm_backend == "claude-code" { llm::Transport::Run(&runner) } else { llm::Transport::Http(&http) } });
                     if let Some(b) = &be { if let Some(w) = egress::evaluate(&cfg, &format!("llm.{}", b.name), &egress::host_of(if b.name == "ollama" { &cfg.llm_ollama_url } else { &cfg.llm_openai_base_url })) { anyhow::bail!("classify run is refused: {w}"); } }
-                    let r = llm::run(&con, &cfg, &rules, be.as_ref(), &llm::RunOpts { dry_run, refresh, limit, batch, model, knn: !no_knn })?;
+                    let r = llm::run(&con, &cfg, &rules, be.as_ref(), &llm::RunOpts { dry_run, refresh, limit, batch, model, knn: !no_knn, batch_api })?;
+                    if let Some((id, new)) = &r.batch { println!("{} batch {id} with {} merchant(s): collect the results with `finch classify batches` (within 24 hours)", if *new { "submitted" } else { "already in flight:" }, r.sent); return Ok(()); }
                     if !r.held_back.is_empty() { println!("{} merchant(s) held back from the LLM because they may be people (label them with `finch classify correct`; see `finch classify review`)", r.held_back.len()); }
                     if r.knn > 0 { println!("{} merchant(s) {}labelled by similarity to labelled ones (no LLM)", r.knn, if dry_run { "would be " } else { "" }); }
                     if let Some(p) = r.dry_payload { println!("DRY RUN: {} merchant(s) in {} request(s); nothing is sent, nothing is written.", r.sent, p.as_array().map_or(0, |a| a.len())); print_json(&p); }
                     else { println!("labelled {}/{} merchants with {}; cost {}", r.labelled, r.sent, cfg.llm_backend, if r.unknown_cost { "unknown for this model".to_string() } else { format!("${:.3}{}", r.cost, if cfg.llm_backend == "claude-code" { " (notional on a subscription)" } else { " (estimate)" }) }); for f in &r.failed { println!("  FAILED {f}"); } if !r.failed.is_empty() { anyhow::bail!("{} batch(es) failed; the others were stored; run again to retry", r.failed.len()); } }
                 }
+                ClsCmd::Batches => { if let Some(w) = egress::evaluate(&cfg, "llm.anthropic-api", "") { anyhow::bail!("refused: {w}"); } let rows = finch::classify::batch::collect(&con, &cfg, &net::UreqHttp::new(120), &rules)?; if rows.is_empty() { println!("no batch in flight"); } for r in rows { println!("  {r}"); } }
                 ClsCmd::Review { out } => { let v = llm::review(&con, &cfg, &rules)?; if out.json { print_json(&v); } else { println!("held back (possible people, never sent to an LLM):"); lines(&v, "held_back_person_like", |x| format!("  {:<40} {:>4} tx {:>10.2}", s(&x["key"]), s(&x["n"]), x["total"].as_f64().unwrap_or(0.0))); println!("low confidence / uncategorised:"); lines(&v, "low_confidence", |x| format!("  {:<40} {:<32} {} ({})", s(&x["key"]), s(&x["category"]), s(&x["confidence"]), s(&x["source"]))); } }
                 ClsCmd::Correct { key, category, name } => println!("labelled {key} as {category} ({} transaction(s))", llm::correct(&con, &rules, &key, &category, name.as_deref())?),
             } }
@@ -343,13 +410,30 @@ fn run() -> Result<()> {
             match l {
                 LoanCmd::List => for x in finch::loans::liabilities_view(&ds, today)["liabilities"].as_array().into_iter().flatten() { println!("  {:<20} {:<14} still due {:>12}  instalment {:>10}  {}", s(&x["id"]), s(&x["kind"]), x["remaining_capital"].as_str().unwrap_or("unknown"), x["schedule"]["payment"].as_str().unwrap_or("-"), x["schedule"]["status"].as_str().unwrap_or("")); },
                 LoanCmd::Show { id, rows } => { let (ls, _) = finch::loans::liabilities(&cfg.memory_dir); let lb = ls.iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("no loan {id:?}"))?; print_json(&finch::loans::compute(lb, today).to_json(rows)); }
+                LoanCmd::Scenario { id, prepay, rate, insurance, external } => { let (ls, _) = finch::loans::liabilities(&cfg.memory_dir); let lb = ls.iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("no loan {id:?}"))?; let sc = finch::loans::compute(lb, today);
+                    print_json(&match (prepay, rate, insurance) { (Some(p), _, _) => finch::loans_extra::prepay(lb, &sc, today, p, None, None)?, (_, Some(r), _) => finch::loans_extra::renegotiate(lb, &sc, today, r, Some(if external { "external" } else { "internal" }), 0.0, 0.0, 0.0, None)?, (_, _, Some(m)) => finch::loans_extra::insurance(&sc, m, 0.0)?, _ => bail!("give --prepay, --rate or --insurance") }); }
+                LoanCmd::Snapshot => print_json(&finch::loans_extra::snapshot(&con, &ds, ds.settings.asset_stale_months as i32)?),
                 LoanCmd::Repay { id, amount } => { let (ls, _) = finch::loans::liabilities(&cfg.memory_dir); let lb = ls.iter().find(|x| x.id == id).ok_or_else(|| anyhow::anyhow!("no loan {id:?}"))?; print_json(&finch::loans::early_repayment(lb, &finch::loans::compute(lb, today), amount.map(finch::loans::cents), today)); }
             } }
-        Cmd::Subs(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true);
+        Cmd::Subs(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let today = ds.today;
             match c {
                 SubsCmd::Inventory { ended, out } => { let v = finch::subs::inventory(&ds, &rec, ended, ds.today); if out.json { print_json(&v); } else { println!("{} services, {} EUR / month, {} EUR / year", s(&v["totals"]["services"]), s(&v["totals"]["monthly"]), s(&v["totals"]["yearly"]));
                     lines(&v, "rows", |r| format!("  {:<28} {:<14} {:>9} /month  contract {:<8} can end now: {}", r["name"].as_str().unwrap_or("").chars().take(28).collect::<String>(), s(&r["group"]), r["monthly"].as_str().unwrap_or("?"), s(&r["contract"]["status"]), r["cancellation"]["can_cancel_now"].as_bool().map_or("unknown", |b| if b { "yes" } else { "no" }))); } }
                 SubsCmd::Cancel { r#ref } => { let v = finch::subs::inventory(&ds, &rec, true, ds.today); let row = v["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == r#ref.as_str() || x["contract_id"] == r#ref.as_str()).ok_or_else(|| anyhow::anyhow!("no service {:?} (see `finch subs inventory`)", r#ref))?; print_json(&row["cancellation"]); }
+                SubsCmd::Alt { r#ref, provider, offer, price, url, seen, switching } => { let row = subs_row(&ds, &rec, &r#ref)?; let seen = seen.map(|x| finch::util::d(&x).ok_or_else(|| anyhow::anyhow!("--seen: YYYY-MM-DD"))).transpose()?;
+                    println!("recorded {}", finch::subs_extra::record_alternative(&con, &row, &provider, &offer, price, switching, None, url.as_deref(), seen, "manual", "cli", today)?); }
+                SubsCmd::AltRm { id } => { if !finch::subs_extra::delete_alternative(&con, &id)? { bail!("no alternative {id:?}"); } println!("removed {id}"); }
+                SubsCmd::Decide { r#ref, decision, before, after, effective, note } => { let v = finch::subs::inventory(&ds, &rec, true, today); let row = subs_row(&ds, &rec, &r#ref)?; let r = v["rows"].as_array().into_iter().flatten().find(|x| x["series_id"] == row.as_str() || format!("ctr_{}", x["contract_id"].as_str().unwrap_or("")) == row).cloned().unwrap_or_default();
+                    let eff = effective.map(|x| finch::util::d(&x).ok_or_else(|| anyhow::anyhow!("--effective: YYYY-MM-DD"))).transpose()?; let before = before.or(r["monthly"].as_str().and_then(|m| m.parse().ok())).unwrap_or(0.0);
+                    print_json(&finch::subs_extra::record_decision(&con, &row, r["name"].as_str(), &decision, before, after, None, eff, note.as_deref(), "cli", "confirmed", today, false)?); }
+                SubsCmd::Decision { id, action } => { use std::io::IsTerminal; if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { bail!("confirming a decision is a human action: run it in an interactive terminal"); }
+                    if !finch::subs_extra::set_decision(&con, &id, &action)? { bail!("no proposed decision {id:?}"); } println!("{id}: {action}ed"); }
+                SubsCmd::Savings => print_json(&finch::subs_extra::savings(&con, &rec, today)?),
+                SubsCmd::Letter { contract, lang, channel, out } => { let c = finch::subs::contracts(&cfg.memory_dir).into_iter().find(|c| c.id == contract).ok_or_else(|| anyhow::anyhow!("no contract {contract:?}"))?; let st = finch::memstore::Store::new(&cfg, "cli")?;
+                    let l = finch::subs_extra::letter(&st, &c, &lang, &channel, today); match out { Some(p) => { std::fs::write(&p, l["text"].as_str().unwrap_or(""))?; println!("written to {} (placeholders to fill: {})", p.display(), l["placeholders"]); } None => println!("{}\n\n{}", s(&l["subject"]), s(&l["text"])) } }
+                SubsCmd::Contact { address, email, phone, dry_run } => { let st = finch::memstore::Store::new(&cfg, "cli")?; if address.is_none() && email.is_none() && phone.is_none() { print_json(&finch::subs_extra::contact(&st)["contact"]); }
+                    else { let r = finch::subs_extra::set_contact(&st, address.as_deref(), email.as_deref(), phone.as_deref(), dry_run)?; println!("{}", if r.diff.is_empty() { "no change".into() } else { r.diff }); } }
+                SubsCmd::Draft { series, dry_run } => { let st = finch::memstore::Store::new(&cfg, "cli")?; let v = finch::subs_extra::draft(&st, &rec, &series, dry_run)?; println!("{}", s(&v["diff"])); if !dry_run { println!("written {}", s(&v["contract"]["file"])); } }
             } }
         Cmd::Rental(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
             match c { RentCmd::List => print_json(&finch::rental::list(&ds)), RentCmd::Show { id, year } => print_json(&finch::rental::detail(&ds, &id, year).ok_or_else(|| anyhow::anyhow!("no rental property {id:?}"))?) } }
@@ -368,7 +452,7 @@ fn run() -> Result<()> {
             match c {
                 AlertCmd::Check { dry_run, no_send } => { let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true); let now = chrono::Utc::now();
                     let v = finch::alerts::evaluate(&con, &ds, &rec, &st, now, dry_run)?; println!("{} signal(s): {} new, {} escalated, {} resolved{}", s(&v["candidates"]), v["new"].as_array().map_or(0, |a| a.len()), v["escalated"].as_array().map_or(0, |a| a.len()), v["resolved"].as_array().map_or(0, |a| a.len()), if dry_run { " (dry run: nothing stored)" } else { "" });
-                    if !no_send { for r in finch::alerts::dispatch(&con, &cfg, &st, now, dry_run, &net::UreqHttp::new(30))? { println!("  {:<9} {:<10} {}{}", s(&r["channel"]), s(&r["status"]), r["reason"].as_str().unwrap_or(""), r["message"]["body"].as_str().map(|b| format!("\n    {}", b.replace('\n', "\n    "))).unwrap_or_default()); } } }
+                    if !no_send { for r in finch::alerts::dispatch(&con, &cfg, &st, now, dry_run, &net::Transports { http: &net::UreqHttp::new(30), smtp: &net::TlsSmtp { timeout_s: 30 }, run: &net::ProcessRunner })? { println!("  {:<9} {:<10} {}{}", s(&r["channel"]), s(&r["status"]), r["reason"].as_str().unwrap_or(""), r["message"]["body"].as_str().map(|b| format!("\n    {}", b.replace('\n', "\n    "))).unwrap_or_default()); } } }
                 AlertCmd::List { all } => for e in finch::alerts::listing(&con, Some(all))? { if !all && !["new", "sent"].contains(&e["status"].as_str().unwrap_or("")) { continue; } println!("  {} {:<7} {:<10} {:<18} {}", s(&e["id"]), s(&e["severity"]), s(&e["status"]), s(&e["kind"]), s(&e["title"])); },
                 AlertCmd::Channels => print_json(&finch::alerts::channels_view(&con, &cfg, &st)?),
                 AlertCmd::Ack { id } => println!("{}", if finch::alerts::act(&con, &id, "ack", None, chrono::Local::now().date_naive())? { "acknowledged" } else { "no such alert" }),
@@ -378,12 +462,42 @@ fn run() -> Result<()> {
         Cmd::Usage { days, out } => { let con = open(true)?; let v = finch::usage::summary(&con, &cfg, days, chrono::Utc::now())?; if out.json { print_json(&v); } else { let t = &v["totals"]; println!("LLM usage, last {days} days: {} call(s), {} tokens in / {} out, {} USD ({} notional on a subscription)", s(&t["calls"]), s(&t["tokens_in"]), s(&t["tokens_out"]), s(&t["cost_usd"]), s(&t["notional_cost_usd"]));
             lines(&v, "lines", |l| format!("  {:<16} {:<14} {:<20} {:>5} calls  {:>8} USD", s(&l["job"]), s(&l["backend"]), l["model"].as_str().unwrap_or("?"), s(&l["calls"]), l["cost_usd"].as_f64().map_or("unknown".into(), |c| format!("{c:.4}")))); } }
         Cmd::Review { year, scope: sa } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; print_json(&finch::analytics::review::year_review(&ds, year, &scope(&sa), 10)); }
-        Cmd::Coach(CoachCmd::Ask { question }) => { use std::io::Write; let con = open(true)?; let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Cmd::Eval(e) => { let con = open(true)?; let rules = Rules::load(&cfg)?; let (anns, _) = finch::memory::load_annotations(&cfg.memory_dir);
+            match e {
+                EvalCmd::Gold(GoldCmd::Bootstrap { dry_run }) => print_json(&finch::quality::bootstrap(&con, &rules, &anns, dry_run)?),
+                EvalCmd::Gold(GoldCmd::Sample { n, strategy, seed }) => for x in finch::quality::sample(&con, &rules, &anns, n, &strategy, seed)? { println!("  {} {} {:>10} {:<30} {} ({})", s(&x["tx_key"]), s(&x["date"]), s(&x["amount"]), s(&x["merchant"]).chars().take(30).collect::<String>(), s(&x["predicted"]), s(&x["source"])); },
+                EvalCmd::Gold(GoldCmd::Label { n, strategy }) => { use std::io::{BufRead, IsTerminal, Write}; if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { bail!("labelling is a human task: run it in an interactive terminal"); }
+                    for x in finch::quality::sample(&con, &rules, &anns, n, &strategy, rand::random())? { print!("{} {} {}  predicted {}  [Enter = correct, a category id, s = skip, q = quit] ", s(&x["date"]), s(&x["amount"]), s(&x["merchant"]), s(&x["predicted"])); std::io::stdout().flush()?;
+                        let mut l = String::new(); std::io::stdin().lock().read_line(&mut l)?; let a = l.trim(); if a == "q" { break; } if a == "s" { continue; } let cat = if a.is_empty() { s(&x["predicted"]) } else { a.to_string() };
+                        match finch::quality::set_gold(&con, &rules, x["tx_key"].as_str().unwrap(), &cat, "user", "manual", None) { Ok(()) => println!("  labelled {cat}"), Err(e) => println!("  not stored: {e}") } } }
+                EvalCmd::Gold(GoldCmd::List) => print_json(&finch::quality::counts(&con)?),
+                EvalCmd::Gold(GoldCmd::Remove { tx_key }) => println!("{}", if finch::quality::remove_gold(&con, &tx_key)? { "removed" } else { "not in the gold set" }),
+                EvalCmd::Classify { no_store, out } => { let v = finch::quality::evaluate(&con, &cfg, &rules, !no_store)?; if out.json { print_json(&v); } else { let h = &v["headline"];
+                    println!("classifier on {} merchant truths: accuracy {} (money {}), macro F1 {}, coverage {}; pipeline accuracy {}", s(&h["n"]), s(&h["accuracy_tx"]), s(&h["accuracy_money"]), s(&h["macro_f1"]), s(&h["coverage_tx"]), s(&v["pipeline"]["accuracy_tx"]));
+                    for r in v["regressions"].as_array().into_iter().flatten() { println!("  REGRESSION {}", s(r)); } lines(h, "confusions", |c| format!("  {} -> {}: {} ({} EUR)", s(&c["gold"]), s(&c["predicted"]), s(&c["n"]), s(&c["money"]))); } }
+                EvalCmd::Coach { offline, skill, limit } => { if !offline { bail!("only --offline is available here: a live coach evaluation sends questions to a model (use the Python app's `coach eval coach --run`)"); } print_json(&finch::quality::coach_offline(&con, skill.as_deref(), limit, true)?); }
+                EvalCmd::Models { models, batch, dry_run } => { let plan = finch::quality::models_plan(&con, &cfg, &rules, &models, batch)?; print_json(&plan); if dry_run { return Ok(()); }
+                    use std::io::{BufRead, IsTerminal, Write}; if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { bail!("a model comparison costs money and sends redacted data: run it in an interactive terminal (or pass --dry-run)"); }
+                    if let Some(w) = egress::evaluate(&cfg, &format!("llm.{}", cfg.llm_backend), &egress::host_of(if cfg.llm_backend == "ollama" { &cfg.llm_ollama_url } else { &cfg.llm_openai_base_url })) { bail!("refused: {w}"); }
+                    print!("Send the gold merchants to {} model(s) shown above? Type yes: ", models.len()); std::io::stdout().flush()?; let mut l = String::new(); std::io::stdin().lock().read_line(&mut l)?; if l.trim() != "yes" { println!("nothing sent"); return Ok(()); }
+                    let (http, runner) = (net::UreqHttp::new(600), net::ProcessRunner); let be = llm::Backend { name: cfg.llm_backend.clone(), cfg: &cfg, con: &con, t: if cfg.llm_backend == "claude-code" { llm::Transport::Run(&runner) } else { llm::Transport::Http(&http) } };
+                    print_json(&serde_json::json!(finch::quality::models_run(&con, &cfg, &rules, &be, &models, batch)?)); }
+                EvalCmd::Runs { kind, limit } => for r in finch::quality::runs(&con, kind.as_deref(), limit)? { println!("  #{} {} {:<8} {:<10} n={} {}", s(&r["id"]), s(&r["ts"]), s(&r["kind"]), r["label"].as_str().or(r["model"].as_str()).unwrap_or(""), s(&r["n"]), r["summary"]); },
+            } }
+        Cmd::Coach(CoachCmd::Skills) => for sp in finch::coach::SPECS.iter() { println!("  {:<20} {:<20} tools: {}", sp.id, sp.title, sp.tool_names().join(", ")); },
+        Cmd::Coach(CoachCmd::Insights { all }) => { let con = open(true)?; let (items, hidden) = finch::insights::coach_items(&con, chrono::Local::now().date_naive(), all)?; for i in &items { println!("  {} {:<9} {:<8} {}", s(&i["id"]), s(&i["status"]), s(&i["kind"]), s(&i["title"])); } if hidden > 0 { println!("  ({hidden} hidden: --all)"); } }
+        Cmd::Coach(CoachCmd::Ask { question, skill }) => { use std::io::Write; let con = open(true)?; let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut emit = |ev: &str, d: serde_json::Value| { match ev { "delta" => { print!("{}", d["text"].as_str().unwrap_or("")); let _ = std::io::stdout().flush(); } "tool_call" => eprintln!("[tool {}]", d["name"].as_str().unwrap_or("")), "proposal" => eprintln!("\n[proposal {}: review it, then `{}`]", s(&d["id"]), s(&d["command"])),
                 "notice" | "error" => eprintln!("\n[{}] {}", ev, d["message"].as_str().unwrap_or("")), "answer" => { println!(); if let Some(u) = d["unverified_numbers"].as_array().filter(|u| !u.is_empty()) { eprintln!("[warning: amounts not returned by a tool: {}]", u.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")); } } _ => {} } };
-            finch::coach::run(&cfg, cli.insecure, &question, &finch::coach::ProcessSpawner, cancel, Some(&con), &mut emit)?; }
+            finch::coach::run_skill(&cfg, cli.insecure, skill.as_deref().unwrap_or("ask"), &question, &finch::coach::ProcessSpawner, cancel, Some(&con), &mut emit)?; }
         Cmd::Memory(m) => { let st = finch::memstore::Store::new(&cfg, "cli")?;
             match m {
+                MemCmd::Doc(DocCmd::Add { file, kind, note, dry_run }) => { let v = finch::docs::add(&st, &file, &kind, note.as_deref(), dry_run)?; println!("{}{}", if dry_run { "DRY RUN " } else { "attached " }, s(&v["id"])); }
+                MemCmd::Doc(DocCmd::List) => for d in st.items("documents.yaml") { println!("  {} {:<10} {} ({} bytes)", s(&d["id"]), s(&d["kind"]), s(&d["added"]), s(&d["bytes"])); },
+                MemCmd::Doc(DocCmd::Extract { id, into, target, send, model }) => { let con = open(true)?; let (http, runner) = (net::UreqHttp::new(600), net::ProcessRunner);
+                    let be = send.then(|| llm::Backend { name: cfg.llm_backend.clone(), cfg: &cfg, con: &con, t: if cfg.llm_backend == "claude-code" { llm::Transport::Run(&runner) } else { llm::Transport::Http(&http) } });
+                    if let Some(b) = &be { if let Some(w) = egress::evaluate(&cfg, &format!("llm.{}", b.name), &egress::host_of(if b.name == "ollama" { &cfg.llm_ollama_url } else { &cfg.llm_openai_base_url })) { bail!("refused: {w}"); } }
+                    print_json(&finch::docs::extract(&st, &con, &id, &into, &target, be.as_ref(), &model)?); }
                 MemCmd::Proposals { status } => { let ps = finch::proposals::listing(&st, Some(&status)); if ps.is_empty() { println!("no {status} proposal"); }
                     for p in ps { println!("{}  {:<9} {:<22} {} op(s)  by {}  {}", p.id, p.status, p.file, p.ops.len(), p.source, p.reason.chars().take(70).collect::<String>()); } }
                 MemCmd::Show { id } => { let p = finch::proposals::get(&st, &id)?; let v = finch::proposals::public(&st, &p);
@@ -399,6 +513,7 @@ fn run() -> Result<()> {
                 MemCmd::Reject { id, note } => { let p = finch::proposals::reject(&st, &id, note.as_deref())?; println!("rejected {}", p.id); }
                 MemCmd::History { file, limit } => for c in st.repo().log(file.as_deref(), limit)? { println!("{}  {}  {:<10} {}{}", c.id, &c.date[..c.date.len().min(19)], c.source.unwrap_or_default(), c.subject, c.reason.map(|r| format!("  ({r})")).unwrap_or_default()); },
                 MemCmd::Diff { id } => print!("{}", st.repo().diff(&id)?),
+                MemCmd::Revert { id } => println!("reverted {id} ({})", st.repo().revert(&st, &id)?.unwrap_or_else(|| "nothing to record".into())),
                 MemCmd::Check => { let mut bad = 0; for (f, _) in finch::memstore::FILES { if !st.exists(f) { continue; } match st.validate(f, &st.read_text(f)) { Ok(w) => { println!("  ok       {f}"); for x in w { println!("  warning  {x}"); } } Err(e) => { bad += 1; println!("  ERROR    {e}"); } } }
                     if finch::questions::md_hand_edited(&st) { println!("  warning  open-questions.md differs from open-questions.yaml"); } if bad > 0 { bail!("{bad} file(s) are invalid"); } }
             } }
@@ -410,6 +525,9 @@ fn run() -> Result<()> {
                 QCmd::Answer { id, text } => done(finch::questions::answer(&st, &id, &text, today, false)?),
                 QCmd::Dismiss { id, reason } => done(finch::questions::dismiss(&st, &id, reason.as_deref(), today, false)?),
                 QCmd::Reopen { id } => done(finch::questions::reopen(&st, &id, false)?),
+                QCmd::Generate { dry_run, min_stake, big } => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let rec = recurring::detect(&ds, &Scope::default(), true);
+                    let qs = finch::qgen::generate(&st, &con, &cfg, &ds, &rec, min_stake, big)?; for q in &qs { println!("{}", finch::questions::render_line(q)); }
+                    if qs.is_empty() { println!("no new question"); } else if dry_run { println!("({} question(s); dry run: nothing added)", qs.len()); } else { finch::qgen::add(&st, &qs, false)?; println!("added {} question(s)", qs.len()); } }
             } }
         Cmd::Household(h) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
             match h {
@@ -488,4 +606,9 @@ fn import(cfg: &config::Config, open: &dyn Fn(bool) -> Result<rusqlite::Connecti
     println!("{}", ingest::format_report(&rep, 10));
     if !a.dry_run && rep.rows_new > 0 { println!("normalised {} transaction(s)", classify::normalize_all(&con, Some(&cfg.memory_dir))?); }
     Ok(())
+}
+/// The canonical ref (rec_ series or ctr_<contract>) of a service of the inventory.
+fn subs_row(ds: &Dataset, rec: &recurring::Recurring, r: &str) -> anyhow::Result<String> {
+    let v = finch::subs::inventory(ds, rec, true, ds.today); let x = v["rows"].as_array().into_iter().flatten().find(|x| x["ref"] == r || x["contract_id"] == r).ok_or_else(|| anyhow::anyhow!("no service {r:?} (see `finch subs inventory`)"))?;
+    Ok(x["series_id"].as_str().map(String::from).or(x["contract_id"].as_str().map(|c| format!("ctr_{c}"))).unwrap_or_default())
 }

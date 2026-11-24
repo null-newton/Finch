@@ -57,6 +57,13 @@ fn web_edits_are_validated_previewed_recorded_and_keep_comments() {
         assert!(subj.iter().any(|x| x == "coach: set-budget budgets.yaml (food-groceries)"), "{subj:?}"); assert!(!subj.iter().any(|x| x.contains("external")), "finch's own lock is never recorded: {subj:?}"); assert!(subj.iter().any(|x| x.starts_with("coach: initial snapshot")));
         assert_eq!(h["changes"][0]["source"], "ui"); let id = h["changes"][0]["id"].as_str().unwrap();
         assert!(w.call("GET", &format!("/api/v1/memory/history/{id}/diff"), None).1["diff"].as_str().unwrap().contains("-  - id: fuel"));
+        let st = finch::memstore::Store::new(&cfg, "cli").unwrap(); st.repo().revert(&st, id).unwrap();
+        assert!(std::fs::read_to_string(mem.join("budgets.yaml")).unwrap().contains("  - id: fuel
+    category: transport.fuel
+    monthly: 80 # car
+"), "the deleted budget is back, comment included");
+        assert!(st.repo().log(None, 1).unwrap()[0].subject.starts_with(&format!("coach: revert {id} budgets.yaml")));
+        assert!(st.repo().revert(&st, "deadbeef").is_err());
     }
     assert_eq!(w.call("GET", "/api/v1/memory/check", None).1["summary"]["errors"], 0);
 }

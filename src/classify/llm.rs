@@ -108,6 +108,14 @@ pub fn eligible_label_keys(con: &Connection, cfg: &Config) -> Result<Set> {
     }).collect())
 }
 
+/// The given merchant keys that may be sent to a model (card-like only, nothing person-like), labelled or not.
+pub fn eligible_keys(con: &Connection, cfg: &Config, keys: &[String]) -> Result<Set> {
+    let h = household(con, Some(&cfg.memory_dir)); let mut out = Set::new();
+    for k in keys { let (raw, ty): (Option<String>, Option<String>) = con.query_row("SELECT MAX(merchant_raw), GROUP_CONCAT(DISTINCT tx_type) FROM tx_enriched WHERE merchant_key=?", [k], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let ts: Set = ty.unwrap_or_default().split(',').filter(|t| !t.is_empty()).map(String::from).collect(); if ts.is_empty() || !ts.iter().all(|t| CARDISH.contains(&t.as_str())) { continue; }
+        let known: Set = if ts.contains("card") || ts.contains("card_refund") { [k.clone()].into() } else { Set::new() }; if !hold_back(k, raw.as_deref(), &ts, &h.family, &h.first_names, &known, &cfg.llm_allowlist, true, &[]) { out.insert(k.clone()); } }
+    Ok(out)
+}
 // ---------------------------------------------------------------- kNN
 pub struct Index { items: Vec<(String, String, String)>, idf: HashMap<String, f64>, vecs: Vec<HashMap<String, f64>>, n: f64 }
 fn ngrams(key: &str) -> HashMap<String, f64> {
@@ -216,6 +224,8 @@ fn parse_json_text(t: &str) -> Result<Value> { let t = t.trim(); let t = t.strip
 /// A model error text without any line that repeats the prompt.
 fn safe_diag(text: &str, prompt: &str) -> String { truncate_chars(&text.lines().map(str::trim).filter(|l| !l.is_empty() && !(l.len() >= 12 && (0..l.len() - 11).step_by(6).any(|i| l.get(i..i + 12).is_some_and(|w| prompt.contains(w))))).collect::<Vec<_>>().join(" "), 200) }
 
+/// The Messages API request of one labelling job (also a Message Batches request's params).
+pub fn anthropic_body(stat: &str, dynamic: &str, schema: &Value, mid: &str) -> Value { json!({"model": mid, "max_tokens": 16000, "system": [{"type": "text", "text": stat, "cache_control": {"type": "ephemeral"}}], "messages": [{"role": "user", "content": dynamic}], "output_config": {"format": {"type": "json_schema", "schema": with_no_additional(schema)}}}) }
 pub fn check_ollama_url(u: &str, allow_remote: bool) -> Result<()> {
     let p = url::Url::parse(u).map_err(|_| anyhow::anyhow!("llm.ollama_url {u:?} is not an http(s) URL"))?;
     if !["http", "https"].contains(&p.scheme()) || p.host_str().is_none() { bail!("llm.ollama_url {u:?} is not an http(s) URL"); }
@@ -258,7 +268,7 @@ impl Backend<'_> {
             }
             "anthropic-api" => {
                 let base = self.cfg.llm_anthropic_base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".into()); let mid = model_id(model); u.model = mid.clone();
-                let body = json!({"model": mid, "max_tokens": 16000, "system": [{"type": "text", "text": stat, "cache_control": {"type": "ephemeral"}}], "messages": [{"role": "user", "content": dynamic}], "output_config": {"format": {"type": "json_schema", "schema": with_no_additional(schema)}}});
+                let body = anthropic_body(stat, dynamic, schema, &mid);
                 let r = http("llm.anthropic-api", &base)?.send("POST", &format!("{}/v1/messages", base.trim_end_matches('/')), &[("x-api-key", Self::secret("anthropic_api_key")?), ("anthropic-version", "2023-06-01".into()), ("content-type", "application/json".into())], Some(&body))?;
                 if r.status >= 400 { bail!("api.anthropic.com answered HTTP {}: {}", r.status, safe_diag(&r.body, &format!("{stat}{dynamic}"))); }
                 let m = r.json()?; let us = &m["usage"]; u.tokens_in = us["input_tokens"].as_i64().unwrap_or(0); u.tokens_out = us["output_tokens"].as_i64().unwrap_or(0); u.cache_read = us["cache_read_input_tokens"].as_i64().unwrap_or(0); u.cache_write = us["cache_creation_input_tokens"].as_i64().unwrap_or(0);
@@ -298,9 +308,9 @@ pub fn upsert_label(con: &Connection, key: &str, name: &str, cat: &str, conf: Op
         params![key, name, cat, conf, hint.map(|h| h as i64), source, model, now_iso()])?; Ok(())
 }
 
-pub struct RunOpts { pub dry_run: bool, pub refresh: bool, pub limit: Option<usize>, pub batch: usize, pub model: Option<String>, pub knn: bool }
+pub struct RunOpts { pub dry_run: bool, pub refresh: bool, pub limit: Option<usize>, pub batch: usize, pub model: Option<String>, pub knn: bool, pub batch_api: bool }
 #[derive(Debug, Default)]
-pub struct RunReport { pub held_back: Vec<String>, pub knn: usize, pub sent: usize, pub labelled: usize, pub cost: f64, pub unknown_cost: bool, pub failed: Vec<String>, pub dry_payload: Option<Value> }
+pub struct RunReport { pub held_back: Vec<String>, pub knn: usize, pub sent: usize, pub labelled: usize, pub cost: f64, pub unknown_cost: bool, pub failed: Vec<String>, pub dry_payload: Option<Value>, pub batch: Option<(String, bool)> }
 /// Label every merchant that needs it: kNN first (no LLM), then the backend, batch by batch, each batch stored as soon as it is paid for.
 pub fn run(con: &Connection, cfg: &Config, rules: &Rules, be: Option<&Backend>, o: &RunOpts) -> Result<RunReport> {
     let mut rep = RunReport::default();
@@ -322,6 +332,7 @@ pub fn run(con: &Connection, cfg: &Config, rules: &Rules, be: Option<&Backend>, 
     if o.dry_run { rep.dry_payload = Some(Value::Array(jobs.iter().enumerate().map(|(i, j)| json!({"request": i + 1, "merchants": j.keys.len(), "static_prompt_chars": j.stat.len(), "static_prompt_sha256": &sha256_hex(j.stat.as_bytes())[..16], "dynamic_prompt": j.dynamic})).collect())); return Ok(rep); }
     let Some(be) = be else { bail!("no backend") };
     let model = o.model.clone().unwrap_or_else(|| be.default_model()); let schema = label_schema(rules);
+    if o.batch_api { if be.name != "anthropic-api" { bail!("--batch-api needs [llm] backend = \"anthropic-api\""); } let Transport::Http(h) = be.t else { bail!("internal: no HTTP transport") }; if !jobs.is_empty() { rep.batch = Some(super::batch::submit(con, cfg, h, rules, &jobs, &model)?); } return Ok(rep); }
     for j in &jobs {
         match be.complete(&j.stat, &j.dynamic, &schema, &model, "label", j.keys.len()) {
             Ok((data, u)) => {

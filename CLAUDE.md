@@ -29,7 +29,8 @@ financial life: treat every figure, name and merchant as private. **Numbers come
   action with a typed yes). Every write goes through `memstore::Store::edit` (validated, diffed, recorded in `.history.git`).
 - Commands that send or expose data are the user's own: never run `finch alerts check` without `--dry-run` or `--no-send` against a
   configuration with channels enabled, never `finch export --plain`, never `finch coach ask` on the real data unasked, and never read
-  the `backup_key`, a channel token or the Enable Banking key. Alert texts for channels stay minimal and pass the privacy guard
+  the `backup_key`, a channel token or the Enable Banking key. Never run `finch eval models` without `--dry-run`, `finch memory doc extract --send`, `finch classify run --batch-api` or
+  `finch eval gold label` (a human task) unasked, and never put a password in the config (`smtp_password` is a secret). Alert texts for channels stay minimal and pass the privacy guard
   (`alerts::compose`); a kid budget never leaves the machine. A new outbound call is a new egress flow in `src/egress.rs`.
 - Every output of the MCP server goes through `mcp::Session::publish` (scan, wrap, cap, guard). Do not add a path around it,
   and add a leak assertion to `tests/e2e.rs` for any new tool.

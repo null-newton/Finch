@@ -101,7 +101,7 @@ fn from_principal(l: &Liability, mut s: Sched, today: NaiveDate) -> Sched {
     s.assumptions.push("annuity loan: constant instalment, interest = capital x monthly rate per instalment".into()); s.assumptions.push(format!("first instalment due {}", rows[0].due));
     if let Some(dv) = &l.deferral { s.assumptions.push(if dv.kind == "total" { format!("total deferral of {} month(s): the interest is added to the capital; the insurance is still paid", dv.months) } else { format!("interest-only deferral of {} month(s): the capital does not move; the insurance is still paid", dv.months) }); }
     s.payment_check = payment_check(l, s.payment, rows[dn as usize].insurance);
-    if let (Some(o), Some(at)) = (l.outstanding, dd(&l.outstanding_as_of)) { let comp = rows.iter().filter(|x| x.due <= at).last().map_or(p, |x| x.balance); let decl = cents(o);
+    if let (Some(o), Some(at)) = (l.outstanding, dd(&l.outstanding_as_of)) { let comp = rows.iter().rfind(|x| x.due <= at).map_or(p, |x| x.balance); let decl = cents(o);
         if (decl - comp).abs() > 5000.max(comp / 50) { s.outstanding_check = Some(json!({"status": "differs", "as_of": at.to_string(), "declared": money_str(decl), "computed": money_str(comp), "hint": "the table differs from the declared capital: the rate, the term, a deferral or an early repayment may not be what the memory says"})); } }
     s.rows = rows; s
 }
@@ -119,7 +119,7 @@ fn from_outstanding(l: &Liability, mut s: Sched, today: NaiveDate) -> Option<Sch
     s.assumptions = notes; s.payment_check = payment_check(l, s.payment, s.rows[0].insurance); Some(s)
 }
 fn finish(l: &Liability, mut s: Sched, _today: NaiveDate) -> Sched {
-    if s.status != "computed" { return s; } s.remaining = Some(s.rows.iter().filter(|r| r.made).last().map_or(s.capital, |r| r.balance));
+    if s.status != "computed" { return s; } s.remaining = Some(s.rows.iter().rfind(|r| r.made).map_or(s.capital, |r| r.balance));
     s.approximate = l.rate.as_ref().is_some_and(|r| matches!(r.ty.as_deref(), Some("variable" | "mixed")));
     if s.approximate { s.assumptions.push("variable / mixed rate: the current rate is applied to the whole term (the bank's table will differ when the index moves)".into()); }
     if s.mode == Some("from_outstanding") { s.assumptions.push("totals and interest paid to date are unknown (the table starts at the declared capital); remaining interest and the yearly figures of the future are exact".into()); }
@@ -179,7 +179,7 @@ pub fn liability_json(ds: &Dataset, l: &Liability, today: NaiveDate, rows: bool)
         "early_repayment_penalty": l.early_repayment_penalty.as_ref().map(crate::memstore::jsonify), "first_payment": l.first_payment.map(|x| money_str(cents(x))), "residual_value": l.residual_value.map(|x| money_str(cents(x))), "mileage_limit_km": l.mileage_limit_km, "excess_km_fee": l.excess_km_fee.map(|x| money_str(cents(x))), "initial_km": l.initial_km, "odometer": [], "notes": l.notes,
         "missing": miss, "open_questions": [], "payments": pays.last().map(|p| json!({"series_id": null, "last_date": p.0.to_string(), "next_expected": s.rows.iter().find(|r| !r.made).map(|r| r.due.to_string()), "amount": money_str(p.1), "status": "observed"})),
         "schedule": s.to_json(rows), "remaining_capital": s.remaining.or(l.outstanding.map(cents)).map(money_str), "remaining_capital_source": if s.remaining.is_some() { json!("schedule") } else if l.outstanding.is_some() { json!("declared") } else { Value::Null },
-        "alerts": [], "payments_seen": pays.len(), "lease": null, "inferred": [], "early_repayment": early_repayment(l, &s, None, today)})
+        "alerts": [], "payments_seen": pays.len(), "lease": crate::loans_extra::lease_view(l, &ds.memory_dir, today), "inferred": crate::loans_extra::infer(ds, l)["fields"], "early_repayment": early_repayment(l, &s, None, today)})
 }
 pub fn liabilities_view(ds: &Dataset, today: NaiveDate) -> Value {
     let (ls, warn) = liabilities(&ds.memory_dir); let items: Vec<Value> = ls.iter().map(|l| liability_json(ds, l, today, false)).collect();
@@ -190,10 +190,10 @@ pub fn liabilities_view(ds: &Dataset, today: NaiveDate) -> Value {
 pub fn loan_detail(ds: &Dataset, id: &str, today: NaiveDate) -> Option<Value> {
     let (ls, _) = liabilities(&ds.memory_dir); let l = ls.iter().find(|l| l.id == id)?; let s = compute(l, today); let pays = payments(ds, l);
     let mut amts: Vec<i64> = pays.iter().map(|p| p.1).collect(); amts.sort();
-    Some(json!({"id": l.id, "kind": l.kind, "schedule": s.to_json(true), "lease": null, "alerts": [], "early_repayment": early_repayment(l, &s, None, today),
+    Some(json!({"id": l.id, "kind": l.kind, "schedule": s.to_json(true), "lease": crate::loans_extra::lease_view(l, &ds.memory_dir, today), "alerts": [], "early_repayment": early_repayment(l, &s, None, today),
         "payments": {"count": pays.len(), "first": pays.first().map(|p| p.0.to_string()), "last": pays.last().map(|p| p.0.to_string()), "last_amount": pays.last().map(|p| money_str(p.1)), "median_amount": (!amts.is_empty()).then(|| money_str(median_c(&amts))),
             "recent": pays.iter().rev().take(12).map(|p| json!({"date": p.0.to_string(), "amount": money_str(p.1), "account": p.2})).collect::<Vec<_>>()},
-        "inference": {"status": "not_available", "notes": ["inferring loan facts from the payments is not ported to finch yet"]}}))
+        "inference": crate::loans_extra::infer(ds, l)}))
 }
 const CATS: [&str; 6] = ["cash", "savings", "investments", "real_estate", "vehicles", "other"];
 pub fn asset_category(kind: &str) -> &'static str { match kind { "regulated_savings" | "savings_account" => "savings", "employee_savings_plan" | "life_insurance_savings" | "securities" | "pension" | "crypto" => "investments", "real_estate" | "real_estate_rental" => "real_estate", "vehicle" => "vehicles", "cash" => "cash", _ => "other" } }

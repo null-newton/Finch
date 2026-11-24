@@ -1,5 +1,6 @@
 //! Classification: descriptor parsing (`normalize`) into tx_enriched / tx_parse_meta, and the category pipeline (`rules`).
 //! Merchant labels (`merchants`): the user's own, kNN near-duplicates and LLM answers (`llm`), all read by the pipeline.
+pub mod batch;
 pub mod llm;
 pub mod parsers;
 pub mod rules;
