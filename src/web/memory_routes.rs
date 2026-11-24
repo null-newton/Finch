@@ -99,6 +99,7 @@ pub fn route(a: &App, r: &Req, seg: &[&str]) -> Option<R> {
             let lang = r.q("lang").filter(|l| ["nl", "fr", "en"].contains(l)).unwrap_or("nl"); let ch = r.q("channel").filter(|l| ["letter", "lrar", "email"].contains(l)).unwrap_or("letter"); ok(crate::subs_extra::letter(&store(a, r)?, &c, lang, ch, a.today())) })(),
         ("GET", ["subs", "contact"]) => (|| ok(crate::subs_extra::contact(&store(a, r)?)))(),
         ("PUT", ["subs", "contact"]) => (|| { let b = r.json()?; let dry = r.qb("dry_run", false); let res = crate::subs_extra::set_contact(&store(a, r)?, b["address"].as_str(), b["email"].as_str(), b["phone"].as_str(), dry).map_err(rej)?; out(a, &res, dry, json!({})) })(),
+        ("POST", ["rental", id, what @ ("extension" | "vacancy" | "market-rate")]) => rental_write(a, r, id, what),
         ("GET", ["memory", "history"]) => (|| { let st = store(a, r)?; ok(json!({"enabled": a.cfg.memory_history, "changes": st.repo().log(r.q("file"), r.qi("limit", Some(50), 1, 500)?.unwrap() as usize).map_err(ApiErr::from)?})) })(),
         ("GET", ["memory", "history", id, "diff"]) => (|| { let st = store(a, r)?; ok(json!({"diff": st.repo().diff(id).map_err(|e| ApiErr::not_found(&e.to_string()))?, "revert_command": format!("finch memory revert {id}")})) })(),
         ("GET", ["memory", "check"]) => (|| { let st = store(a, r)?; let issues = check(&st); ok(json!({"summary": summary(&issues), "issues": issues})) })(),
@@ -143,6 +144,29 @@ pub fn last_run(log_dir: &std::path::Path) -> Option<Value> {
     runs.pop().map(|(_, mut r)| { let f = |s: &str| r["steps"].as_array().into_iter().flatten().filter(|x| x["status"] == s).map(|x| x["step"].clone()).collect::<Vec<_>>(); let (fa, wa) = (f("error"), f("warn")); r["failed"] = fa.into(); r["warned"] = wa.into(); r })
 }
 
+/// The three small writes of the rental page on the property's item of assets.yaml: the extension decision, a vacancy period, a market
+/// rate the owner typed in (never looked up). `dry_run=true` previews.
+fn rental_write(a: &App, r: &Req, id: &str, what: &str) -> R {
+    let s = a.snap()?; let p = crate::rental::properties(&s.ds).into_iter().find(|p| p.id == id).ok_or_else(|| ApiErr::not_found(&format!("no rental property with id {id:?}")))?; let b = r.json()?;
+    let text = |k: &str, max: usize| -> Result<Option<String>, ApiErr> { match b[k].as_str().filter(|x| !x.trim().is_empty()) { Some(x) if x.chars().count() > max => Err(ApiErr::new(422, "validation_error", &format!("the request is not valid: {k}: at most {max} characters"))), x => Ok(x.map(String::from)) } };
+    let num = |k: &str, lo: f64, hi: f64| -> Result<Option<f64>, ApiErr> { match &b[k] { Value::Null => Ok(None), v => v.as_f64().filter(|x| (lo..=hi).contains(x)).map(Some).ok_or_else(|| ApiErr::new(422, "validation_error", &format!("the request is not valid: {k}: {lo} to {hi}"))) } };
+    let reason = text("reason", 300)?; let today = a.today().to_string();
+    let (path, v, action, why) = match what {
+        "extension" => { let dec = b["decision"].as_str().filter(|x| ["undecided", "extend", "not_extend"].contains(x)).ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: decision: undecided, extend or not_extend"))?;
+            let years = num("years", 1.0, 30.0)?.filter(|y| y.fract() == 0.0); if b["years"].is_number() && years.is_none() { return Err(ApiErr::new(422, "validation_error", "the request is not valid: years: a whole number")); }
+            if dec == "extend" && years.is_none() { return Err(ApiErr::new(422, "missing_field", "the length of the extension (years) is needed to record an extension")); }
+            let mut e = json!({"decision": dec, "decided_on": date(&b, "decided_on")?.unwrap_or(today)}); if let Some(y) = years { e["years"] = json!(y as i64); } if let Some(x) = num("additional_rate_pct", 0.0, 100.0)? { e["additional_rate_pct"] = self::num(x); } if let Some(n) = text("note", 500)? { e["note"] = n.into(); }
+            ("commitment.extension", e, "rental-extension", format!("extension decision: {dec}")) }
+        "vacancy" => { let st = date(&b, "start")?.ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: start: field required"))?; let en = date(&b, "end")?;
+            if en.as_ref().is_some_and(|e| *e < st) { return Err(ApiErr::new(422, "bad_period", "the end of the period is before its start")); }
+            let one = |s: &str, e: Option<&str>, n: Option<&str>| { let mut o = json!({"start": s}); if let Some(e) = e { o["end"] = e.into(); } if let Some(n) = n { o["note"] = n.into(); } o };
+            let mut cur: Vec<Value> = p.vacancies.iter().map(|v| one(&v.start, v.end.as_deref(), v.note.as_deref())).collect(); cur.push(one(&st, en.as_deref(), text("note", 300)?.as_deref()));
+            ("vacancies", json!(cur), "rental-vacancy", "a vacancy period".to_string()) }
+        _ => { let rate = num("rate_pct", 0.0, 25.0)?.ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: rate_pct: field required"))?;
+            let mut m = json!({"rate_pct": self::num(rate), "as_of": date(&b, "as_of")?.unwrap_or(today)}); if let Some(x) = text("source", 200)? { m["source"] = x.into(); }
+            ("market_rate", m, "rental-market-rate", "market rate entered by the owner".to_string()) } };
+    edit(a, r, "assets.yaml", vec![op("set", &format!("assets[{id}].{path}"), v)], action, Some(reason.unwrap_or(why)), id, json!({"id": id}))
+}
 fn budget(a: &App, r: &Req) -> R {
     let b = r.json()?; let st = store(a, r)?; let target = b["target"].as_str().unwrap_or("");
     let key = if let Some(g) = target.strip_prefix("group:").or((!target.contains('.')).then_some(target)) { if !st.categories.iter().any(|c| c.split('.').next() == Some(g)) { return Err(ApiErr::new(422, "unknown_group", &format!("unknown category group {g:?}"))); } ("group", g.to_string()) }

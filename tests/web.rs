@@ -163,6 +163,40 @@ fn coach_resolve() {
     assert_eq!(c.call("POST", "/api/v1/coach/resolve", Some(json!({"refs": []}))).0, 422);
 }
 
+#[test]
+fn rental_writes_and_indicators() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None); let m = tmp.path().join("memory");
+    std::fs::write(m.join("assets.yaml"), "assets:\n  - id: flat\n    kind: real_estate_rental\n    account: Zichtrekening\n    value: 200000\n    as_of: 2025-04-01\n    rent_monthly: 700\n").unwrap();
+    std::fs::create_dir_all(m.join("liabilities")).unwrap(); std::fs::write(m.join("liabilities/hyp.yaml"), "id: hyp\nkind: mortgage\nasset: flat\noutstanding: 150000\noutstanding_as_of: 2025-04-01\nrate:\n  type: fixed\n  nominal: 3.5\n").unwrap();
+    let assets = || std::fs::read_to_string(m.join("assets.yaml")).unwrap();
+    // indicators: no market rate recorded (nothing is looked up), the equity from the declared value and outstanding
+    let i = c.get("/api/v1/rental/flat/indicators"); assert_eq!(i["market_rate"]["status"], "missing"); assert_eq!(i["loan_rate"]["missing"], json!(["a market rate you entered"]));
+    assert_eq!((i["equity"]["status"].as_str(), i["equity"]["net_equity"].as_str(), i["equity"]["outstanding"].as_str()), (Some("computed"), Some("50000.00"), Some("150000.00"))); assert_eq!(i["disclaimer_key"], "loan");
+    assert_eq!(c.call("GET", "/api/v1/rental/nope/indicators", None).0, 404); assert_eq!(c.call("GET", "/api/v1/rental/flat/indicators?market_rate=99", None).0, 422);
+    let g = c.get("/api/v1/rental/flat/indicators?market_rate=3.4&market_date=2025-05-01"); assert_eq!((g["loan_rate"]["status"].as_str(), g["market_rate"]["basis"].as_str()), (Some("close_to_market"), Some("given for this call")));
+    // a market rate the owner typed in: previewed, then recorded through the memory store
+    let before = assets(); let (s, v) = c.call("POST", "/api/v1/rental/flat/market-rate?dry_run=true", Some(json!({"rate_pct": 2.5, "as_of": "2025-03-01", "source": "own quote"}))); assert_eq!((s, v["changed"].as_bool()), (200, Some(true)), "{v}"); assert_eq!(assets(), before, "a dry run writes nothing");
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/market-rate", Some(json!({"rate_pct": 30}))).0, 422);
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/market-rate", Some(json!({"rate_pct": 2.5, "as_of": "2025-03-01", "source": "own quote"}))).0, 200);
+    let i = c.get("/api/v1/rental/flat/indicators"); assert_eq!((i["market_rate"]["basis"].as_str(), i["market_rate"]["age_days"].as_i64(), i["loan_rate"]["status"].as_str(), i["loan_rate"]["gap_pts"].as_f64()), (Some("recorded on the property"), Some(70), Some("above_market"), Some(1.0)));
+    assert!(i["market_rate"]["warning"].as_str().unwrap().contains("70 days old")); let sig: Vec<&str> = i["signals"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect(); assert_eq!(sig, ["rate_above_market", "equity_positive"]);
+    assert!(i["loan_rate"]["reading"].as_str().unwrap().ends_with("This is general information, not financial advice."));
+    // a vacancy period
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/vacancy", Some(json!({"start": "2025-03-01", "end": "2025-02-01"}))).0, 422);
+    assert_eq!(c.call("POST", "/api/v1/rental/flat/vacancy", Some(json!({"start": "2025-03-01", "end": "2025-03-31", "note": "works"}))).0, 200);
+    let rd = c.get("/api/v1/rental/flat"); assert_eq!(rd["asset"]["vacancies"], json!([{"start": "2025-03-01", "end": "2025-03-31", "note": "works"}])); assert_eq!(rd["asset"]["market_rate"]["rate_pct"], 2.5);
+    // the commitment the owner recorded shows, and the extension decision is recorded on it
+    assert_eq!(rd["scheme"]["declared"], false); assert_eq!(c.call("POST", "/api/v1/rental/flat/extension", Some(json!({"decision": "extend"}))).0, 422, "an extension needs its years");
+    assert_eq!(c.call("PUT", "/api/v1/memory/assets/flat", Some(json!({"fields": {"commitment": {"start_date": "2016-06-01", "years": 9, "rent_cap_monthly": 650}}}))).0, 200);
+    let sc = c.get("/api/v1/rental/flat")["scheme"].clone(); assert_eq!((sc["state"].as_str(), sc["end_date"].as_str(), sc["decision_needed"].as_bool()), (Some("active"), Some("2025-05-31"), Some(true)), "{sc}");
+    assert_eq!((sc["rent_cap"]["status"].as_str(), sc["rent_cap"]["gap"].as_str()), (Some("above_cap"), Some("50.00")));
+    let (s, v) = c.call("POST", "/api/v1/rental/flat/extension", Some(json!({"decision": "extend", "years": 3, "note": "x"}))); assert_eq!(s, 200, "{v}");
+    let rd = c.get("/api/v1/rental/flat"); assert_eq!((rd["scheme"]["effective_end_date"].as_str(), rd["scheme"]["extension"]["decision"].as_str(), rd["scheme"]["decision_needed"].as_bool()), (Some("2028-05-31"), Some("extend"), Some(false)));
+    assert_eq!(rd["asset"]["commitment"]["extension"]["decided_on"], "2025-05-10"); assert_eq!(c.get("/api/v1/rental/properties")["properties"][0]["scheme"]["state"], "active");
+    assert_eq!(c.get("/api/v1/rental/flat/indicators")["commitment"]["effective_end_date"], "2028-05-31");
+    assert_eq!(c.call("POST", "/api/v1/rental/nope/vacancy", Some(json!({"start": "2025-03-01"}))).0, 404);
+}
+
 fn git_ok() -> bool { std::process::Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) }
 #[test]
 fn memory_lists_and_health() {

@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-const DISC: &str = "Estimate from the figures you gave, not an offer: your bank or a broker gives the binding numbers. General information, not financial advice; no product is recommended.";
+pub const DISC: &str = "Estimate from the figures you gave, not an offer: your bank or a broker gives the binding numbers. General information, not financial advice; no product is recommended.";
 fn verdict(net: i64) -> Value { json!({"verdict": if net > 0 { "saves money" } else { "costs more than it saves" }, "verdict_code": if net > 0 { "saves" } else { "costs" }}) }
 fn needs(s: &Sched) -> Option<Value> { (s.status != "computed").then(|| json!({"status": "needs_fields", "missing": s.missing, "alternative": s.alternative})) }
 fn break_even(base: &[(i64, i64, i64, i64)], alt: &[(i64, i64, i64, i64)], pen: i64) -> Option<usize> { if pen == 0 { return Some(0); } let mut acc = 0; for (i, b) in base.iter().enumerate() { acc += b.0 - alt.get(i).map_or(0, |a| a.0); if acc >= pen { return Some(i + 1); } } None }

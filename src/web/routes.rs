@@ -117,6 +117,11 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["subs", "savings"]) => { let s = a.snap()?; ok(crate::subs_extra::savings(&a.con()?, &s.rec, a.today())?) }
         ("GET", ["rental", "properties"]) => { let s = a.snap()?; ok(crate::rental::list(&s.ds)) }
         ("GET", ["rental", _, "tax"]) => ok(crate::rental::tax(r.qi("year", Some(chrono::Datelike::year(&a.today()) as i64 - 1), 2000, 2100)?.unwrap() as i32)),
+        ("GET", ["rental", id, "indicators"]) => { let s = a.snap()?; let p = crate::rental::properties(&s.ds).into_iter().find(|p| p.id == *id).ok_or_else(|| ApiErr::not_found("no such rental property"))?;
+            let f = |k: &str| r.q(k).map(|v| v.replace(',', ".").parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0).ok_or_else(|| ApiErr::new(422, "bad_amount", &format!("{k}: a number")))).transpose();
+            let rate = f("market_rate")?; if rate.is_some_and(|x| x > 25.0) { return Err(ApiErr::new(422, "bad_rate", "the market rate is a percentage between 0 and 25")); }
+            let day = r.q("market_date").map(|x| d(x).ok_or_else(|| ApiErr::new(422, "validation_error", "the request is not valid: market_date: YYYY-MM-DD"))).transpose()?;
+            ok(crate::rental::indicators(&s.ds, &p, rate, day, [f("bank_fees")?, f("guarantee_fees")?, f("other_fees")?, f("penalty")?])) }
         ("GET", ["rental", id]) => { let s = a.snap()?; crate::rental::detail(&s.ds, id, r.qi("year", None, 2000, 2100)?.map(|y| y as i32)).map(Resp::json).ok_or_else(|| ApiErr::not_found("no such rental property")) }
         ("GET", ["alerts"]) => { let s = crate::alerts::Settings::load(&a.cfg).map_err(ApiErr::rejected)?; ok(crate::alerts::alerts_view(&a.con()?, &s, r.q("status"), r.q("kind"), r.q("severity"), r.qb("include_resolved", false))?) }
         ("GET", ["alerts", "summary"]) => ok(crate::alerts::summary(&a.con()?)?),
