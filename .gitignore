@@ -18,3 +18,4 @@ web/dist/
 /desktop/gen/
 /desktop/binaries/
 /node_modules/
+/.claude/worktrees/
