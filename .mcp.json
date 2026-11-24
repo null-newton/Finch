@@ -1,5 +1,5 @@
 {
   "mcpServers": {
-    "finance": { "command": "finch", "args": ["mcp", "serve"] }
+    "finance": { "command": "${FINCH_BIN:-finch}", "args": ["mcp", "serve"] }
   }
 }

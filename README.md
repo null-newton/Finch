@@ -47,6 +47,47 @@ Python app, so both can work on the same data while the port is in progress.
 
 Not ported: web enrichment of merchant names (it sends merchant names to a search service, which finch does not do) and the local HTTPS callback for the bank login (paste the redirect address instead). The web app edits memory for the person at the keyboard; a model only ever proposes.
 
+## Desktop app
+
+`desktop/` is a Tauri app: it starts finch's own web server on a loopback port inside the app and shows it in a native window, with
+the `finch` command line installed next to it (the coach runs `finch mcp serve`). The page gets no access to the Tauri API; links to
+other sites open in your browser.
+
+The app keeps its own local home in the OS app-data folder (Windows `%APPDATA%e.finch.desktop`, macOS
+`~/Library/Application Support/be.finch.desktop`, Linux `~/.local/share/be.finch.desktop`) and sets it up on first start: `config.toml`,
+`data/`, `memory/`, a random database key kept in the OS keychain (service `finch-desktop`, apart from the command line's), and the
+encrypted database with every migration. Nothing is changed in an existing home. `COACH_HOME` or `COACH_CONFIG` point the app at
+another home (for example the one the command line uses).
+
+Updates are signed (minisign key, see Release) and **off by default**: `[update] check = true` in config.toml makes the app look for a
+newer release at start and every 6 hours; the menu's *Check for updates…* asks once. Either way the check only contacts GitHub, sends
+no data, is journalled as the `update.github` egress flow, is refused under `[privacy] offline` / `local_only`, and installs only after
+you click *Install and restart*.
+
+```
+npm install                          # the Tauri CLI
+npm run desktop                      # dev: builds the command line sidecar, runs the app
+npm run bundle                       # installers in desktop/target/release/bundle
+```
+
+Without perl (SQLCipher) try it plain on a scratch home: `FINCH_FEATURES=keychain node scripts/sidecar.mjs`, then
+`npx tauri build --debug --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --no-default-features`.
+
+## Release
+
+1. Once: create the update signing key and give it to GitHub (a human step: the private key never goes into the repository):
+   `npx tauri signer generate -w ~/.tauri/finch.key`, paste the public key into `plugins.updater.pubkey` of
+   `desktop/tauri.conf.json`, and add the repository secrets `TAURI_SIGNING_PRIVATE_KEY` (the content of the key file) and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+2. `npm run release patch` (or `minor`, `major`, `1.2.3`; `-- --dry-run` to preview) on a clean `main`: bumps `Cargo.toml`,
+   `desktop/Cargo.toml`, both lockfiles and `web/package.json`, commits "Release vX", tags and pushes.
+3. The tag runs `.github/workflows/build.yml`: Windows (.exe / .msi), macOS universal for Apple Silicon + Intel (.dmg) and Linux
+   (.AppImage / .deb / .rpm) with SQLCipher and the OS keychain, the update bundles signed, everything plus `latest.json` attached to a
+   draft release. Publish the draft: the updater reads `releases/latest/download/latest.json`.
+
+`.github/workflows/check.yml` runs the web tests and build, clippy and the Rust tests on every push to `main` and every pull request.
+The repository must stay public for the updater to fetch `latest.json` without a login.
+
 ## Belgian banks
 
 The Belgian parser reads the usual Dutch, French and English descriptor wording: Bancontact / debit-card / contactless
@@ -117,7 +158,21 @@ finch ui --login-link            # a fresh link for a running server; --rotate-s
 `--dry-run` shows what an import would write. `--json` prints the raw result of `coverage`, `cashflow` and `averages`.
 The CLI prints local values; only the MCP server redacts, because it talks to a model.
 
-To use the tools from Claude Code, `.mcp.json` declares the server `finance` (`finch mcp serve`).
+To use the tools from Claude Code, `.mcp.json` declares the server `finance` (`finch mcp serve`). Claude Code starts it
+as a child process, so before you approve it with `/mcp`:
+
+1. **Put `finch` on PATH**: `cargo install --path . --locked` (add `--features "sqlcipher keychain"` for an encrypted
+   database; it installs into `~/.cargo/bin`, re-run it after pulling changes). Or point at a build without installing:
+   set `FINCH_BIN` to the full path of `target/release/finch.exe` before you start Claude Code.
+2. **Give it a home with a database.** The server reads `$COACH_HOME`, else the nearest parent of the folder Claude Code
+   runs in that holds `config.toml` / `config.example.toml` (from this repository that is the Python app's folder `..`),
+   else `~/.ai-finance-coach`. Set `COACH_HOME` (or `COACH_DB` and friends) to your finch home before you start Claude
+   Code, and check it with `finch config` and `finch coverage`. Without a database the server exits at once ("No database
+   at ...") and Claude Code shows "connection closed".
+3. A plaintext database needs `insecure_plaintext_db = true` in that home's `config.toml` (a `sqlcipher` build needs
+   none). Never add `--insecure` to `.mcp.json`.
+
+If it still says "connection closed", run `finch mcp serve` in the same shell: it prints the reason and exits.
 
 ## Develop
 

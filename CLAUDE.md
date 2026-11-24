@@ -19,6 +19,30 @@ financial life: treat every figure, name and merchant as private. **Numbers come
 7. Prefer the MCP tools to the CLI: the CLI prints raw names, descriptions and account labels. Never read the database,
    `memory/` or `data/` files directly. Never pass `--insecure` for the user's real database.
 
+## Project map (agents: read this and `docs/BACKLOG.md` instead of exploring the tree)
+
+- **Crate** `finch` (`Cargo.toml`, lib + bin): `src/lib.rs` lists every module; each file starts with a `//!` line saying what it owns.
+  CLI in `src/main.rs`. Features: `sqlcipher` (encrypted DB, needs full perl on Windows), `keychain` (OS secret store).
+- **Data path**: `ingest/` (CSV / OFX / CAMT.053 / CODA imports, `bank.rs` = Enable Banking sync) -> `db.rs` + `migrations/` (schema shared
+  with the Python app) -> `classify/` (`parsers/belgian.rs`, `rules.rs` + `assets/rules.yaml`, `llm.rs`, `batch.rs`) -> `analytics/`
+  (pure functions over a `Dataset`), `transfers.rs`, `insights.rs`, `alerts.rs`.
+- **Household & memory**: `memory.rs` (read-only), `memstore.rs` (the ONLY writer), `proposals.rs`, `questions.rs`, `qgen.rs`,
+  `household.rs`, `docs.rs`. Wealth: `loans.rs`, `loans_extra.rs`, `rental.rs`, `subs.rs`, `subs_extra.rs`.
+- **Boundaries**: `privacy/` (redaction, guard), `mcp/` (stdio server; tools in `mod.rs`, `memory_tools.rs`, `wealth_tools.rs`, `people.rs`;
+  every output through `Session::publish`), `web/` (`finch ui`: `mod.rs` server + security, `routes.rs` / `memory_routes.rs` API under
+  `/api/v1`, unported ones answer 404 `not_ported`), `egress.rs` + `net.rs` (every outbound call; traits so tests inject fakes),
+  `coach.rs` (`claude -p` and API backends), `backup.rs`, `secrets.rs`, `config.rs`, `home.rs` (desktop first-run home), `quality.rs`, `usage.rs`.
+- **Tests** `tests/`: `e2e.rs` (imports -> MCP, leak assertions), `web.rs` (API + security), `phase3.rs` (bank sync, fake transports),
+  `household.rs`, `memory.rs`, `wealth.rs`, `phase5d.rs` (backups, alerts, coach). Synthetic data only.
+- **Web app** `web/` (React + Vite + pnpm, i18n in `web/src/locales`): API hooks in `web/src/api/hooks.ts`, pages in `web/src/pages/`,
+  tests next to them (`*.test.tsx`). `pnpm build` writes `static/`, which `finch ui` serves.
+- **Desktop** `desktop/` (Tauri 2): runs finch's web server on loopback in a window; `scripts/sidecar.mjs` builds the bundled `finch`
+  binary, `scripts/release.mjs` bumps versions and tags (`npm run release`). Root `package.json` = Tauri CLI only.
+- **CI** `.github/workflows/check.yml` (every push / PR: pnpm test + build, clippy `-D warnings`, cargo test, desktop clippy) and
+  `build.yml` (tag `v*`: signed installers for Windows / macOS / Linux into a draft release).
+- **Parent repo** `..` is the Python app (`../src/coach/`, `../docs/`): the reference for parity work; finch's own backlog is `docs/BACKLOG.md`.
+- **Done means**: `cargo test`, `cargo clippy --all-targets -- -D warnings`, and for UI changes `cd web && pnpm test && pnpm build`.
+
 ## Working on the code
 
 - Code style: compact and dense, one-line comments above functions only when the name is not self-explanatory.
@@ -30,7 +54,8 @@ financial life: treat every figure, name and merchant as private. **Numbers come
 - Commands that send or expose data are the user's own: never run `finch alerts check` without `--dry-run` or `--no-send` against a
   configuration with channels enabled, never `finch export --plain`, never `finch coach ask` on the real data unasked, and never read
   the `backup_key`, a channel token or the Enable Banking key. Never run `finch eval models` without `--dry-run`, `finch memory doc extract --send`, `finch classify run --batch-api` or
-  `finch eval gold label` (a human task) unasked, and never put a password in the config (`smtp_password` is a secret). Alert texts for channels stay minimal and pass the privacy guard
+  `finch eval gold label` (a human task) unasked, and never put a password in the config (`smtp_password` is a secret). Never generate, read or print the updater signing
+  key (`~/.tauri/finch.key`) and never change `plugins.updater` in `desktop/tauri.conf.json` or the release secrets: the owner's. Alert texts for channels stay minimal and pass the privacy guard
   (`alerts::compose`); a kid budget never leaves the machine. A new outbound call is a new egress flow in `src/egress.rs`.
 - Every output of the MCP server goes through `mcp::Session::publish` (scan, wrap, cap, guard). Do not add a path around it,
   and add a leak assertion to `tests/e2e.rs` for any new tool.
