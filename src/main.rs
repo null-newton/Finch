@@ -342,7 +342,8 @@ fn run() -> Result<()> {
             for c in v["categories"].as_array().unwrap() { println!("{:<36}{:>12}{:>14}{:>8}{}", s(&c["category"]), s(&c["monthly_avg"]), s(&c["monthly_avg_with_one_offs"]), s(&c["n_months"]), if c["low_confidence"] == true { "  (low confidence)" } else { "" }); }
             for u in v["unavailable"].as_array().unwrap() { println!("{:<36}  unavailable: {}", s(&u["category"]), s(&u["reason"])); }
             for n in v["coverage"]["notes"].as_array().unwrap() { println!("note: {}", s(n)); } } }
-        Cmd::Mcp(McpCmd::Serve) => { if let Some(w) = egress::evaluate(&cfg, "mcp.finance", "") { anyhow::bail!("the finance MCP server does not start: {w}"); } mcp::serve(mcp::Session::open(cfg, cli.insecure)?)? }
+        Cmd::Mcp(McpCmd::Serve) => { if let Some(w) = egress::evaluate(&cfg, "mcp.finance", "") { anyhow::bail!("the finance MCP server does not start: {w}"); }
+            eprintln!("finch mcp: home {} (config {}, database {})", cfg.root.display(), cfg.config_path.as_ref().map_or("none, defaults".into(), |p| p.display().to_string()), cfg.db_path.display()); mcp::serve(mcp::Session::open(cfg, cli.insecure)?)? }
         Cmd::Transfers(t) => { let con = open(true)?; let o = transfers::Opts::from(&cfg); let rules = Rules::load(&cfg)?; let (ann, _) = finch::memory::load_annotations(&cfg.memory_dir);
             match t {
                 TrCmd::Match { link } => { let r = transfers::match_transfers(&con, &rules, &ann, &cfg.memory_dir, &o, link || cfg.transfer_auto_link)?; println!("{}", transfers::format_result(&r, link || cfg.transfer_auto_link)); }

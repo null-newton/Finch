@@ -172,7 +172,11 @@ fn m0020(con: &Connection) -> Result<()> {
     con.execute_batch("CREATE TABLE IF NOT EXISTS compliance_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, source TEXT NOT NULL, insight_id TEXT,
         codes TEXT NOT NULL DEFAULT '[]', flags TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT 'en'); CREATE INDEX IF NOT EXISTS idx_compliance_ts ON compliance_events(ts)")?; Ok(())
 }
+/// Python truthiness of a JSON value (`m0023` mirrors `value_date or transaction_date`).
+fn truthy(v: &serde_json::Value) -> bool { use serde_json::Value::*; match v { Null => false, Bool(b) => *b, Number(n) => n.as_f64() != Some(0.0), String(s) => !s.is_empty(), Array(a) => !a.is_empty(), Object(o) => !o.is_empty() } }
+/// Dateless rows: take the raw `value_date or transaction_date` when booked (status absent, null, "" or "BOOK"), else move to pending.
 fn m0023(con: &Connection) -> Result<()> {
+    use serde_json::Value::Null;
     let mut st = con.prepare("SELECT tx_key, account_uid, amount, currency, counterparty, description, raw FROM transactions WHERE booking_date IS NULL OR booking_date = ''")?;
     type Row = (String, Option<String>, Option<f64>, Option<String>, Option<String>, Option<String>, Option<String>);
     let rows: Vec<Row> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -181,9 +185,11 @@ fn m0023(con: &Connection) -> Result<()> {
     for t in user_tables(con)?.into_iter().filter(|t| t != "transactions" && t != "tx_key_remap") { for c in ["tx_key", "out_tx_key", "in_tx_key"] { if has_column(con, &t, c)? { refs.push((t.clone(), c)); } } }
     for (key, uid, amt, cur, party, desc, raw) in rows {
         let tx: serde_json::Value = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_default();
-        let day = tx.get("value_date").or_else(|| tx.get("transaction_date")).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
-        let status = tx.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(dd) = &day { if status.is_empty() || status == "BOOK" { con.execute("UPDATE transactions SET booking_date=? WHERE tx_key=?", params![truncate_chars(dd, 10), key])?; continue; } }
+        let (vd, td) = (tx.get("value_date").unwrap_or(&Null), tx.get("transaction_date").unwrap_or(&Null));
+        let dv = if truthy(vd) { vd } else { td };
+        let day = match dv { Null => None, serde_json::Value::String(s) => Some(s.clone()), v => Some(v.to_string()) };
+        let booked = matches!(tx.get("status"), None | Some(Null)) || tx.get("status").and_then(|v| v.as_str()).is_some_and(|s| s.is_empty() || s == "BOOK");
+        if let (true, true, Some(dd)) = (truthy(dv), booked, &day) { con.execute("UPDATE transactions SET booking_date=? WHERE tx_key=?", params![truncate_chars(dd, 10), key])?; continue; }
         con.execute("INSERT INTO pending_transactions VALUES (?,?,?,?,?,?,?)", params![uid, day, amt, cur, party, desc, raw])?;
         for (t, c) in &refs { con.execute(&format!("DELETE FROM {t} WHERE {c}=?"), [&key])?; }
         con.execute("DELETE FROM transactions WHERE tx_key=?", [&key])?;
@@ -200,4 +206,24 @@ fn m0025(con: &Connection) -> Result<()> {
         if let Some((kb, ka, kd)) = k { if fp::content_key(kb.as_deref().unwrap_or(""), ka, kd.as_deref()) == fp::content_key(bd.as_deref().unwrap_or(""), amt, desc.as_deref()) { fp::replace_tx_key(con, &key, &kept, "duplicate of the bank reference row")?; } }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn m0023_matches_python_truthiness_and_status() {
+        let con = Connection::open_in_memory().unwrap(); apply_migrations(&con, false, None).unwrap();
+        let rows = [("k1", r#"{"value_date":"","transaction_date":"2024-03-05"}"#), ("k2", r#"{"value_date":null,"transaction_date":"2024-03-06T10:00:00"}"#),
+            ("k3", r#"{"value_date":"2024-03-07","status":null}"#), ("k4", r#"{"value_date":"2024-03-08","status":1}"#), ("k5", r#"{"value_date":"2024-03-09","status":"OTHR"}"#),
+            ("k6", r#"{"value_date":"","transaction_date":""}"#), ("k7", "not json"), ("k8", r#"{"transaction_date":"2024-03-10","status":"BOOK"}"#), ("k9", r#"["2024-03-11"]"#)];
+        for (k, raw) in rows { con.execute("INSERT INTO transactions(tx_key, account_uid, amount, raw) VALUES (?,'acc-1',-1.5,?)", params![k, raw]).unwrap(); }
+        m0023(&con).unwrap();
+        let mut st = con.prepare("SELECT tx_key, booking_date FROM transactions ORDER BY tx_key").unwrap();
+        let kept: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(kept, [("k1", "2024-03-05"), ("k2", "2024-03-06"), ("k3", "2024-03-07"), ("k8", "2024-03-10")].map(|(a, b)| (a.to_string(), b.to_string())));
+        let mut st = con.prepare("SELECT booking_date FROM pending_transactions").unwrap();
+        let mut pend: Vec<Option<String>> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect(); pend.sort();
+        assert_eq!(pend, [None, None, Some(String::new()), Some("2024-03-08".into()), Some("2024-03-09".into())]);
+    }
 }

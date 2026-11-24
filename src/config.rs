@@ -33,11 +33,20 @@ fn expand(p: &str) -> PathBuf { p.strip_prefix("~/").map(|r| home().join(r)).unw
 pub fn expand_path(p: &str) -> PathBuf { expand(p) }
 fn under(root: &Path, p: &str) -> PathBuf { let p = expand(p); if p.is_absolute() { p } else { root.join(p) } }
 
-/// $COACH_HOME, else the nearest parent holding config.toml / config.example.toml, else ~/.ai-finance-coach.
+/// $COACH_HOME, else `root_from(cwd)`, else ~/.ai-finance-coach (the home shared with the Python app).
 pub fn find_root() -> PathBuf {
     if let Some(h) = env::var_os("COACH_HOME") { return expand(&h.to_string_lossy()); }
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    cwd.ancestors().find(|d| d.join(CONFIG_NAME).exists() || d.join("config.example.toml").exists()).map(Path::to_path_buf).unwrap_or_else(|| home().join(".ai-finance-coach"))
+    root_from(&env::current_dir().unwrap_or_else(|_| ".".into())).unwrap_or_else(|| home().join(".ai-finance-coach"))
+}
+fn is_finch_crate(d: &Path) -> bool { std::fs::read_to_string(d.join("Cargo.toml")).ok().and_then(|s| s.parse::<Table>().ok()).is_some_and(|t| t.get("package").and_then(|p| p.get("name")).and_then(Value::as_str) == Some("finch")) }
+/// Nearest ancestor holding config.toml (or config.example.toml in a finch crate); the walk never goes above a finch crate root.
+pub fn root_from(cwd: &Path) -> Option<PathBuf> {
+    for d in cwd.ancestors() {
+        let krate = is_finch_crate(d);
+        if d.join(CONFIG_NAME).exists() || (krate && d.join("config.example.toml").exists()) { return Some(d.to_path_buf()); }
+        if krate { return None; }
+    }
+    None
 }
 
 struct Picker<'a> { raw: &'a Table, rows: Vec<(String, String, String)> }
@@ -125,3 +134,22 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 pub fn show(c: &Config) -> String { c.rows.iter().map(|(k, v, s)| format!("{k:<34} {v}{}", if s.is_empty() { String::new() } else { format!("  ({s})") })).collect::<Vec<_>>().join("\n") }
 
 pub fn analytics_overrides(c: &Config) -> BTreeMap<String, String> { c.analytics.iter().map(|(k, v)| (k.clone(), v.to_string())).collect() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn root_lookup_stops_at_the_finch_crate() {
+        let t = tempfile::tempdir().unwrap(); let (py, w) = (t.path().join("py"), |p: &Path, n: &str, s: &str| std::fs::write(p.join(n), s).unwrap());
+        let (finch, other) = (py.join("finch"), py.join("tools"));
+        for d in [finch.join("src"), other.join("sub")] { std::fs::create_dir_all(d).unwrap(); }
+        w(&py, "config.example.toml", ""); w(&finch, "Cargo.toml", "[package]\nname = \"finch\"\n");
+        assert_eq!(root_from(&finch.join("src")), None, "never climbs into the parent repo");
+        assert_eq!(root_from(&other.join("sub")), None, "an example file outside a finch crate is not a home");
+        w(&finch, "config.example.toml", ""); assert_eq!(root_from(&finch.join("src")), Some(finch.clone()));
+        w(&py, CONFIG_NAME, ""); assert_eq!(root_from(&other.join("sub")), Some(py.clone()), "a real config.toml is a (shared) home");
+        assert_eq!(root_from(&finch.join("src")), Some(finch.clone()));
+        std::fs::remove_file(finch.join("config.example.toml")).unwrap(); assert_eq!(root_from(&finch.join("src")), None);
+        w(&finch, CONFIG_NAME, ""); assert_eq!(root_from(&finch.join("src")), Some(finch));
+    }
+}
