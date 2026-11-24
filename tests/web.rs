@@ -150,6 +150,19 @@ fn insight_states() {
     assert_eq!(c.call("POST", "/api/v1/insights/cin_1/restore", Some(json!({}))).1["status"], "new"); assert_eq!(c.get("/api/v1/insights")["coach"]["items"].as_array().unwrap().len(), 1);
 }
 
+#[test]
+fn coach_resolve() {
+    let tmp = tempfile::tempdir().unwrap(); let a = app(tmp.path()); let c = C::login(&a, None);
+    let t = c.get("/api/v1/transactions?q=colruyt&limit=1")["items"][0].clone(); let h = finch::privacy::stable_hash(t["tx_key"].as_str().unwrap());
+    let rec = c.get("/api/v1/subscriptions?status=all")["series"][0]["id"].as_str().unwrap().to_string();
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO anomalies(id, type, severity, payload, first_seen, last_seen) VALUES ('anm_abc123', 'new_merchant', 'low', '{}', 'x', 'x')", []).unwrap();
+    let (s, v) = c.call("POST", "/api/v1/coach/resolve", Some(json!({"refs": [h, rec, "anm_abc123", "anm_ffffff", "chg_ffffff", "h_0000000000", "zz", h]}))); assert_eq!(s, 200, "{v}"); let m = &v["refs"];
+    assert_eq!(m[&h], json!({"kind": "transaction", "tx_key": t["tx_key"], "date": t["date"], "amount": t["amount"], "category": t["category"], "merchant": t["entity"]}));
+    assert_eq!(m[&rec]["link"], "/subscriptions"); assert_eq!(m["anm_abc123"]["kind"], "anomaly");
+    for x in ["anm_ffffff", "chg_ffffff", "h_0000000000", "zz"] { assert!(m.get(x).is_some_and(Value::is_null), "an invented ref resolves to nothing: {x}"); }
+    assert_eq!(c.call("POST", "/api/v1/coach/resolve", Some(json!({"refs": []}))).0, 422);
+}
+
 fn git_ok() -> bool { std::process::Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) }
 #[test]
 fn memory_lists_and_health() {

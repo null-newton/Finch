@@ -134,6 +134,7 @@ pub fn route(a: &App, r: &Req) -> R {
         ("GET", ["coach", "status"]) => ok(crate::coach::status(&a.cfg, a.coach.as_ref(), a.coach_job.lock().unwrap().as_ref().map(|j| j.0.clone()))),
         ("GET", ["coach", "prompts"]) => ok(json!({"prompts": crate::coach::quick_prompts()})),
         ("POST", ["coach", "stream"]) => coach_stream(a, r),
+        ("POST", ["coach", "resolve"]) => coach_resolve(a, r),
         ("POST", ["coach", "jobs", id, "cancel"]) => { match a.coach_job.lock().unwrap().as_ref() { Some((j, c)) if j == id => { c.store(true, std::sync::atomic::Ordering::SeqCst); ok(json!({"id": id, "cancelled": true})) } _ => Err(ApiErr::not_found("no such running job")) } }
         ("GET", ["review", "ai"]) => ok(json!({"available": false, "web_search": false, "backend": a.cfg.llm_backend, "message": NOT_PORTED})),
         // the shell asks for these on every page: empty answers until their features are ported
@@ -591,6 +592,23 @@ fn put_prefs(a: &App, r: &Req) -> R {
     a.con()?.execute("UPDATE ui_users SET prefs=? WHERE id=?", params![Value::Object(merged.clone()).to_string(), u.id])?; ok(json!({"prefs": merged}))
 }
 
+/// The evidence refs of an answer (h_ hashes, rec_ / anm_ / chg_ ids) as links; the h_ -> transaction mapping stays on the server,
+/// and a ref the model invented resolves to null.
+fn coach_resolve(a: &App, r: &Req) -> R {
+    let refs: Vec<String> = r.json()?["refs"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    if refs.is_empty() || refs.len() > 50 { return Err(ApiErr::new(422, "validation_error", "the request is not valid: refs: 1 to 50 refs")); }
+    let s = a.snap()?; let con = a.con()?; let whole = s.ds.whole(); let mut hashes: std::collections::HashMap<String, &Tx> = Default::default();
+    if refs.iter().any(|x| x.starts_with("h_")) { for t in &whole { hashes.entry(crate::privacy::stable_hash(&t.key)).or_insert(t); } }
+    let chg: HashSet<String> = if refs.iter().any(|x| x.starts_with("chg_")) { recurring::price_changes(&s.ds, &s.rec, None, false, &HashSet::new(), true)["changes"].as_array().into_iter().flatten().filter_map(|c| c["id"].as_str().map(String::from)).collect() } else { HashSet::new() };
+    let mut out = Map::new();
+    for rf in refs { if out.contains_key(&rf) { continue; }
+        let v = if rf.starts_with("h_") { hashes.get(&rf).map(|t| json!({"kind": "transaction", "tx_key": t.key, "date": t.date.to_string(), "amount": money_str(t.amount_c), "category": t.category, "merchant": if t.entity.is_empty() { &t.mkey } else { &t.entity }})) }
+            else if rf.starts_with("rec_") { s.rec.json["series"].as_array().into_iter().flatten().any(|x| x["id"] == rf.as_str()).then(|| json!({"kind": "series", "link": "/subscriptions"})) }
+            else if rf.starts_with("anm_") { con.query_row("SELECT 1 FROM anomalies WHERE id=?", [&rf], |_| Ok(())).optional().map_err(anyhow::Error::from)?.map(|_| json!({"kind": "anomaly", "link": "/insights"})) }
+            else if rf.starts_with("chg_") { chg.contains(&rf).then(|| json!({"kind": "price_change", "link": "/insights"})) } else { None };
+        out.insert(rf, v.unwrap_or(Value::Null)); }
+    ok(json!({"refs": out}))
+}
 /// Ask the coach: the answer streams as server-sent events from a worker thread (one question at a time).
 fn coach_stream(a: &App, r: &Req) -> R {
     let b = r.json()?; let skill = b["skill"].as_str().unwrap_or("ask").to_string(); if crate::coach::spec(&skill).is_none() { return Err(ApiErr::new(422, "validation_error", "the request is not valid: skill: unknown")); }
