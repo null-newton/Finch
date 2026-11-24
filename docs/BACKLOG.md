@@ -49,3 +49,14 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 
 - **B11 Python app retirement plan [needs owner].** Once B4/B5 land, decide whether finch becomes the only app and the Python one is
   frozen (shared schema rule then relaxes).
+
+## Owner decisions 2026-11-24 (queued: start after the B4 / B5 branches are merged, they touch the same files)
+
+- **B13 AI category suggestion [agent].** Port `POST /review/suggest` + `GET /review/suggest/{job}` and fix `GET /review/ai`'s shape,
+  LABEL-ONLY (redacted label, no web search), as a new opt-in egress flow. After B4.
+- **B14 `add_insight` MCP tool [agent].** Port with the Python safeguards (refs seen in the session, unverified numbers flagged, privacy
+  masking, max 10 per session), `readOnlyHint: false`. After B5.
+- **B15 Setup and onboarding pages [agent].** `/setup/wizard` (finch command names), `/onboarding`, `PUT /onboarding/household` (country
+  `BE` allowed in finch; the Python app may still reject it), `POST /onboarding/preferences`; share the library with B5's `onboarding_status`.
+- **B16 Larger ports [agent].** `memory_context` and `what_if` MCP tools (extend `validate()` for `oneOf` / `items`), asset rename across
+  files (a multi-file `memstore` change, one history entry).
