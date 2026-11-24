@@ -46,6 +46,9 @@ llm_allowlist = []                # regexes of transfer-like merchant keys (comp
                                   # direct-debit counterparty is sent only if it looks like an organisation or is a
                                   # known merchant; anything that could be a person is held back
                                   # (see `coach classify run --dry-run` and `classify review`).
+review_suggest = false            # opt-in: the web app's Review page may ask the [llm] backend for ONE merchant's category
+                                  # (it receives the redacted merchant label and the taxonomy only, no web search; refused
+                                  # under [privacy] offline / local_only; a suggestion is applied only by your own click)
 
 [sync]
 daily_limit = 4                   # max unattended syncs per account per day (PSD2 cap)

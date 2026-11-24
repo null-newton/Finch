@@ -2,7 +2,7 @@
 //! under /api answers 404 `not_ported`. Reads come from the cached [`Snap`]; writes go through the existing functions and `touch()`.
 use super::{ApiErr, App, Job, Req, Resp, R};
 use crate::{analytics::{self, anomalies, averages::{category_averages, spending_txs}, cashflow::cashflow, planning, recurring, Dataset, Scope, Tx, is_income, is_transfer},
-    classify::{self, llm, rules::Rules}, household, ingest::{accounts, bank}, memory, transfers, util::*};
+    classify::{self, llm, rules::Rules, suggest}, household, ingest::{accounts, bank}, memory, transfers, util::*};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -141,7 +141,9 @@ pub fn route(a: &App, r: &Req) -> R {
         ("POST", ["coach", "stream"]) => coach_stream(a, r),
         ("POST", ["coach", "resolve"]) => coach_resolve(a, r),
         ("POST", ["coach", "jobs", id, "cancel"]) => { match a.coach_job.lock().unwrap().as_ref() { Some((j, c)) if j == id => { c.store(true, std::sync::atomic::Ordering::SeqCst); ok(json!({"id": id, "cancelled": true})) } _ => Err(ApiErr::not_found("no such running job")) } }
-        ("GET", ["review", "ai"]) => ok(json!({"available": false, "web_search": false, "backend": a.cfg.llm_backend, "message": NOT_PORTED})),
+        ("GET", ["review", "ai"]) => { let (w, l) = (suggest::web_status(), suggest::label_status(&a.cfg)); ok(json!({"web": {"allowed": w.0, "code": w.1, "why": w.2}, "label": {"allowed": l.0, "code": l.1, "why": l.2}})) }
+        ("POST", ["review", "suggest"]) => suggest_start(a, r),
+        ("GET", ["review", "suggest", id]) => a.suggest_jobs.lock().unwrap().iter().find(|j| j.id == *id).map(|j| ok(j.to_json())).unwrap_or_else(|| Err(ApiErr::not_found("no such suggestion (the server may have restarted): ask again"))),
         // the shell asks for these on every page: empty answers until their features are ported
         _ => super::memory_routes::route(a, r, &seg).unwrap_or_else(|| Err(ApiErr::new(404, "not_ported", NOT_PORTED))),
     }
@@ -303,8 +305,25 @@ fn review(a: &App, r: &Req) -> R {
     let names: BTreeMap<String, Option<String>> = con.prepare("SELECT merchant_key, merchant_name FROM merchants")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>().map_err(anyhow::Error::from)?;
     let mut items: Vec<Value> = v["low_confidence"].as_array().cloned().unwrap_or_default().into_iter().map(|x| { let k = x["key"].as_str().unwrap_or("").to_string(); let t = to_cents(x["total"].as_f64().unwrap_or(0.0));
         json!({"key": k, "name": names.get(&k).cloned().flatten().unwrap_or(k.clone()), "category": x["category"], "confidence": x["confidence"], "source": x["source"], "reason": if x["category"] == "other.uncategorized" { "uncategorized" } else { "low_confidence" }, "n": null, "total": money_str(t), "at_stake": money_str(t), "banks": [], "accounts": []}) }).collect();
-    items.extend(v["held_back_person_like"].as_array().cloned().unwrap_or_default().into_iter().map(|x| { let t = money_str(to_cents(x["total"].as_f64().unwrap_or(0.0))); json!({"key": x["key"], "name": x["key"], "category": "other.uncategorized", "confidence": null, "source": "held_back", "reason": "not_labelled", "n": x["n"], "total": t, "at_stake": t, "banks": [], "accounts": []}) }));
+    items.extend(v["held_back_person_like"].as_array().cloned().unwrap_or_default().into_iter().map(|x| { let t = money_str(to_cents(x["total"].as_f64().unwrap_or(0.0))); json!({"key": x["key"], "name": x["key"], "category": "other.uncategorized", "confidence": null, "source": "held_back", "reason": "held_back_person_like", "n": x["n"], "total": t, "at_stake": t, "banks": [], "accounts": []}) }));
     ok(json!({"total": items.len(), "items": items.into_iter().take(limit).collect::<Vec<_>>()}))
+}
+/// Ask the `[llm]` backend for one queued merchant's category (label-only, a proposal: only the usage is stored); the page polls the job.
+fn suggest_start(a: &App, r: &Req) -> R {
+    let k = body_str(r, "key")?; let (rl, con) = (rules(a)?, a.con()?); let v = llm::review(&con, &a.cfg, &rl)?; let has = |l: &str| v[l].as_array().into_iter().flatten().any(|x| x["key"] == k.as_str());
+    if has("held_back_person_like") { return Err(ApiErr::new(409, "person_like", "this merchant may be a person: it is never sent to an AI; choose its category yourself")); }
+    if !has("low_confidence") { return Err(ApiErr::new(404, "not_in_queue", "this merchant is not in the review queue (already decided by you, a rule or memory)")); }
+    let plan = suggest::plan(&con, &a.cfg, &rl, &k).map_err(|e| ApiErr::new(409, e.code, &e.msg))?; drop(con);
+    let Some((job, new)) = suggest::register(&mut a.suggest_jobs.lock().unwrap(), &k) else { return Err(ApiErr::new(409, "busy", &format!("{} suggestions are already running: wait for one to finish", suggest::MAX_RUNNING))) };
+    if new { let id = job.id.clone(); run_job(a, move |app| {
+        let res = (|| -> anyhow::Result<Option<Value>> { let con = app.con()?; let (http, rl) = ((app.http)(), Rules::load(&app.cfg)?);
+            let be = llm::Backend { name: app.cfg.llm_backend.clone(), cfg: &app.cfg, con: &con, t: if app.cfg.llm_backend == "claude-code" { llm::Transport::Run(app.runner.as_ref()) } else { llm::Transport::Http(http.as_ref()) } };
+            suggest::ask(&con, &app.cfg, &rl, &be, &plan) })();
+        let mut js = app.suggest_jobs.lock().unwrap(); let Some(j) = js.iter_mut().find(|j| j.id == id) else { return };
+        match res { Ok(Some(s)) => { j.state = "done".into(); j.suggestion = Some(s); j.finished_at = Some(now_iso()); } Ok(None) => j.fail("unusable_answer", "the model's answer could not be used: try again"),
+            Err(e) => { let m = e.root_cause().to_string(); j.fail(if m.starts_with("egress refused") { "egress_refused" } else { "error" }, &m) } }
+    }); }
+    let out = a.suggest_jobs.lock().unwrap().iter().find(|j| j.id == job.id).map_or_else(|| job.to_json(), |j| j.to_json()); ok(out)
 }
 fn review_confirm(a: &App, r: &Req) -> R {
     let k = body_str(r, "key")?; let con = a.con()?;

@@ -60,8 +60,9 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 
 ## Owner decisions 2026-11-24 (queued: start after the B4 / B5 branches are merged, they touch the same files)
 
-- **B13 AI category suggestion [agent].** Port `POST /review/suggest` + `GET /review/suggest/{job}` and fix `GET /review/ai`'s shape,
-  LABEL-ONLY (redacted label, no web search), as a new opt-in egress flow. After B4.
+- **B13 AI category suggestion [done 2026-11-24: `src/classify/suggest.rs`, opt-in `[classify] review_suggest`, egress flow `classify.suggest`].** Port `POST /review/suggest` + `GET /review/suggest/{job}` and fix `GET /review/ai`'s shape,
+  LABEL-ONLY (redacted label, no web search), as a new opt-in egress flow. After B4. `/review/ai` reports web search as `not_ported`; held-back merchants
+  now carry the reason `held_back_person_like` (the page hides the AI button for them); only low-confidence LLM / kNN labels can be asked about.
 - **B14 `add_insight` MCP tool [agent].** Port with the Python safeguards (refs seen in the session, unverified numbers flagged, privacy
   masking, max 10 per session), `readOnlyHint: false`. After B5.
 - **B15 Setup and onboarding pages [agent].** `/setup/wizard` (finch command names), `/onboarding`, `PUT /onboarding/household` (country
