@@ -165,3 +165,83 @@ fn anthropic_message_batches_submit_resume_collect() {
     let cost: f64 = con.query_row("SELECT cost_usd FROM llm_usage WHERE purpose='label'", [], |r| r.get(0)).unwrap(); assert!((cost - 0.000625).abs() < 1e-9, "half the price: {cost}");
     assert!(finch::classify::batch::collect(&con, &cfg, &http, &rules).unwrap().is_empty(), "nothing left in flight");
 }
+
+// Local HTTPS callback (B10): loopback only, in-process; the "browser" is a rustls client that trusts the generated certificate.
+mod callback_server {
+    use super::*;
+    use finch::ingest::callback::{self, Outcome};
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    use std::{io::{Read, Write}, net::TcpStream, sync::Arc, time::{Duration, Instant}};
+
+    fn get(port: u16, cert: &std::path::Path, target: &str) -> String {
+        let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from_pem_file(cert).unwrap()).unwrap();
+        let cc = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        let mut t = rustls::StreamOwned::new(rustls::ClientConnection::new(Arc::new(cc), "localhost".try_into().unwrap()).unwrap(), TcpStream::connect(("127.0.0.1", port)).unwrap());
+        write!(t, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap(); let mut b = vec![]; let _ = t.read_to_end(&mut b); String::from_utf8_lossy(&b).into()
+    }
+    fn browser(port: u16, cert: std::path::PathBuf, targets: Vec<String>) -> std::thread::JoinHandle<Vec<String>> { std::thread::spawn(move || targets.iter().map(|t| get(port, &cert, t)).collect()) }
+    fn sessions_calls(http: &FakeHttp) -> usize { http.log.borrow().iter().filter(|x| x.1.ends_with("/sessions")).count() }
+    fn started(c: &bank::Client, http: &FakeHttp) -> String { http.on("POST", "/auth", 200, json!({"url": "https://bank.example/login"})); bank::start_auth(c, "KBC", "BE", 180, None, false).unwrap().0 }
+
+    #[test]
+    fn redirect_address_and_port() {
+        assert_eq!(callback::parse_redirect("https://localhost:8443/callback").unwrap(), (8443, "/callback".into()));
+        assert_eq!(callback::parse_redirect("https://127.0.0.1/cb").unwrap(), (443, "/cb".into()));
+        for bad in ["http://localhost:8443/callback", "https://example.org/callback", "https://0.0.0.0:8443/callback", "not a url"] { assert!(callback::parse_redirect(bad).is_err(), "{bad}"); }
+        let l = callback::bind(0).unwrap(); let port = l.local_addr().unwrap().port();
+        assert!(l.local_addr().unwrap().ip().is_loopback(), "binds 127.0.0.1 only");
+        assert!(callback::bind(port).unwrap_err().to_string().contains("already served"), "a port in use is refused");
+    }
+
+    #[test]
+    fn certificate_generated_once_private_and_reused() {
+        let tmp = tempfile::tempdir().unwrap(); let dir = tmp.path().join("tls"); callback::tls_config(&dir).unwrap();
+        let first = std::fs::read(dir.join(callback::CERT)).unwrap(); callback::tls_config(&dir).unwrap();
+        assert_eq!(first, std::fs::read(dir.join(callback::CERT)).unwrap(), "reused, not regenerated");
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(dir.join(callback::KEY)).unwrap().permissions().mode() & 0o077, 0); }
+        std::fs::write(dir.join(callback::KEY), "garbage").unwrap(); callback::tls_config(&dir).unwrap();
+        assert_ne!(first, std::fs::read(dir.join(callback::CERT)).unwrap(), "an unreadable pair is regenerated");
+    }
+
+    #[test]
+    fn happy_path_rejects_foreign_state_and_is_single_use() {
+        let (t, cfg, con) = home(""); let http = FakeHttp::default(); let c = client(&cfg, &con, &http); let state = started(&c, &http);
+        http.on("POST", "/sessions", 200, json!({"session_id": "s1", "aspsp": {"name": "KBC", "country": "BE"}, "access": {"valid_until": "2099-01-01T00:00:00+00:00"}, "accounts": [{"uid": "u1", "account_id": {"iban": "BE68539007547034"}, "name": "Zichtrekening", "currency": "EUR"}]}));
+        let dir = t.path().join("data/tls"); let tls = callback::tls_config(&dir).unwrap(); let l = callback::bind(0).unwrap(); let port = l.local_addr().unwrap().port();
+        let b = browser(port, dir.join(callback::CERT), vec!["/favicon.ico".into(), "/callback?code=abc&state=0000".into(), "/callback?code=abc".into(), format!("/callback?code=abc&state={state}")]);
+        let info = callback::serve(&l, tls.clone(), "/callback", Duration::from_secs(20), |q| bank::callback_outcome(&c, &state, q)).unwrap().expect("finished");
+        let r = b.join().unwrap();
+        assert!(r[0].starts_with("HTTP/1.1 404"), "{}", r[0]); assert!(r[1].starts_with("HTTP/1.1 400") && r[1].contains("Not this login")); assert!(r[2].contains("Not this login"), "no state keeps waiting");
+        assert!(r[3].starts_with("HTTP/1.1 200") && r[3].contains("You can close this tab") && !r[3].contains("abc"), "{}", r[3]);
+        assert_eq!((info["session_id"].as_str(), info["accounts"][0]["new"].as_bool()), (Some("s1"), Some(true))); assert_eq!(sessions_calls(&http), 1, "foreign states never reach the bank");
+        let b = browser(port, dir.join(callback::CERT), vec![format!("/callback?code=abc&state={state}")]);
+        let e = callback::serve(&l, tls, "/callback", Duration::from_secs(20), |q| bank::callback_outcome(&c, &state, q)).unwrap_err().to_string();
+        assert!(e.contains("already completed"), "{e}"); assert!(b.join().unwrap()[0].contains("Connection failed")); assert_eq!(sessions_calls(&http), 1, "a state is completed once");
+    }
+
+    #[test]
+    fn bank_error_ends_without_a_session() {
+        let (t, cfg, con) = home(""); let http = FakeHttp::default(); let c = client(&cfg, &con, &http); let state = started(&c, &http);
+        let dir = t.path().join("data/tls"); let tls = callback::tls_config(&dir).unwrap(); let l = callback::bind(0).unwrap(); let port = l.local_addr().unwrap().port();
+        let b = browser(port, dir.join(callback::CERT), vec![format!("/callback?error=access_denied&state={state}")]);
+        let e = callback::serve(&l, tls, "/callback", Duration::from_secs(20), |q| bank::callback_outcome(&c, &state, q)).unwrap_err().to_string();
+        assert!(e.contains("returned an error"), "{e}"); assert!(b.join().unwrap()[0].starts_with("HTTP/1.1 400")); assert_eq!(sessions_calls(&http), 0);
+    }
+
+    #[test]
+    fn timeout_with_an_idle_client_consumes_nothing_and_paste_still_works() {
+        let (t, cfg, con) = home(""); let http = FakeHttp::default(); let c = client(&cfg, &con, &http); let state = started(&c, &http);
+        let tls = callback::tls_config(&t.path().join("data/tls")).unwrap(); let l = callback::bind(0).unwrap();
+        let _idle = TcpStream::connect(l.local_addr().unwrap()).unwrap(); let t0 = Instant::now();
+        let r = callback::serve(&l, tls, "/callback", Duration::from_millis(600), |_| Outcome::<Value>::Wait("never".into())).unwrap();
+        assert!(r.is_none()); assert!(t0.elapsed() < Duration::from_secs(5), "an idle connection cannot hold the server past its timeout");
+        http.on("POST", "/sessions", 200, json!({"session_id": "s2", "aspsp": {"name": "KBC", "country": "BE"}, "access": {"valid_until": "2099-01-01T00:00:00+00:00"}, "accounts": []}));
+        assert_eq!(bank::complete_auth(&c, "abc", Some(&state)).unwrap()["session_id"], "s2", "the paste fallback completes the same login");
+    }
+
+    #[test]
+    fn config_opt_in() {
+        let (_t, cfg, _con) = home(""); assert!(!cfg.callback_enabled, "paste stays the default"); assert_eq!(cfg.callback_timeout, 600);
+        let (_t, cfg, _con) = home("[callback]\nenabled = true\ntimeout_seconds = 120\n"); assert!(cfg.callback_enabled); assert_eq!(cfg.callback_timeout, 120);
+    }
+}

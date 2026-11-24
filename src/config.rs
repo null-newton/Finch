@@ -11,7 +11,7 @@ pub const LLM_BACKENDS: [&str; 4] = ["claude-code", "anthropic-api", "ollama", "
 pub struct Config {
     pub root: PathBuf, pub config_path: Option<PathBuf>, pub data_dir: PathBuf, pub memory_dir: PathBuf, pub db_path: PathBuf,
     pub insecure_plaintext_db: bool, pub db_auto_migrate: bool,
-    pub eb_app_id: Option<String>, pub eb_redirect_url: Option<String>, pub eb_private_key_path: Option<String>, pub eb_api_url: String,
+    pub eb_app_id: Option<String>, pub eb_redirect_url: Option<String>, pub eb_private_key_path: Option<String>, pub eb_api_url: String, pub callback_enabled: bool, pub callback_timeout: i64,
     pub llm_backend: String, pub llm_model: String, pub llm_anthropic_model: String, pub llm_anthropic_base_url: Option<String>, pub llm_ollama_url: String, pub llm_ollama_model: String,
     pub llm_ollama_allow_remote: bool, pub llm_openai_base_url: String, pub llm_openai_model: String, pub llm_openrouter_deny_data_collection: bool, pub llm_allowlist: Vec<String>,
     pub knn_enabled: bool, pub knn_threshold: f64, pub knn_examples: i64, pub sync_daily_limit: i64, pub privacy_egress_journal: bool, pub coach_claude_env: Vec<String>, pub coach_claude_restricted: bool,
@@ -95,6 +95,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         insecure_plaintext_db: p.b("insecure_plaintext_db", false)?, db_auto_migrate: p.b("db.auto_migrate", true)?,
         eb_app_id: p.os("enable_banking.app_id", Some("EB_APP_ID"))?, eb_redirect_url: p.os("enable_banking.redirect_url", Some("EB_REDIRECT_URL"))?,
         eb_private_key_path: p.os("enable_banking.private_key_path", Some("EB_PRIVATE_KEY_PATH"))?, eb_api_url: p.s("enable_banking.api_url", DEFAULT_API_URL, Some("EB_API_URL"))?,
+        callback_enabled: p.b("callback.enabled", false)?, callback_timeout: p.i("callback.timeout_seconds", 600)?,
         llm_backend: p.s("llm.backend", "claude-code", None)?, llm_model: p.s("llm.model", "sonnet", None)?, llm_anthropic_model: p.s("llm.anthropic_model", "claude-haiku-4-5", None)?,
         llm_anthropic_base_url: p.os("llm.anthropic_base_url", None)?, llm_ollama_url: p.s("llm.ollama_url", "http://localhost:11434", None)?, llm_ollama_model: p.s("llm.ollama_model", "llama3.1", None)?,
         llm_ollama_allow_remote: p.b("llm.ollama_allow_remote", false)?, llm_openai_base_url: p.s("llm.openai_base_url", "https://openrouter.ai/api/v1", None)?, llm_openai_model: p.s("llm.openai_model", "", None)?,
@@ -112,6 +113,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     };
     if !(0.0 < c.knn_threshold && c.knn_threshold <= 1.0) { bail!("classify.knn_threshold must be a number in (0, 1]"); }
     if !(1..=720).contains(&c.ui_session_hours) || c.ui_key_rotation_days < 1 { bail!("ui.session_hours must be 1..720 and ui.key_rotation_days >= 1"); }
+    if !(1..=3600).contains(&c.callback_timeout) { bail!("callback.timeout_seconds must be 1..3600"); }
     if c.sync_daily_limit < 1 { bail!("sync.daily_limit must be >= 1"); }
     for r in &c.llm_allowlist { if fancy_regex::Regex::new(r).is_err() { bail!("classify.llm_allowlist: bad regex {r:?}"); } }
     if c.coach_claude_env.iter().any(|n| !n.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')) { bail!("coach.claude_env must be a list of environment variable names"); }

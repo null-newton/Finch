@@ -61,6 +61,9 @@ dir = "backups"                   # encrypted archives are written here
 retention = 14                    # keep the N most recent archives
 
 [callback]
+# enabled = false                 # finch only: true = `finch bank connect` / `reconnect` receive the redirect on 127.0.0.1 themselves
+                                  # (redirect_url must then be https://localhost:PORT/PATH, registered exactly in your Enable Banking app);
+                                  # false = paste the address (the Python app always uses its server)
 timeout_seconds = 600             # how long `coach connect` / `reconnect` wait for the bank redirect on the
                                   # local HTTPS server (host/port come from [enable_banking] redirect_url,
                                   # default https://localhost:8443/callback; TLS cert in <data_dir>/tls/)

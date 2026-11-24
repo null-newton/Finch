@@ -58,6 +58,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1"
 rand = "0.8"
 base64 = "0.22"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

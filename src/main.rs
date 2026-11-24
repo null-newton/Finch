@@ -2,7 +2,7 @@
 #![allow(clippy::possible_missing_else, clippy::unnecessary_sort_by, clippy::suspicious_else_formatting, clippy::type_complexity, clippy::too_many_arguments, clippy::result_large_err)]
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, profiles}, mcp, net, secrets, transfers, web};
+use finch::{analytics::{self, anomalies, averages::category_averages, cashflow::cashflow, planning, recurring, Dataset, Scope}, classify::{self, llm, rules::Rules}, config, db, egress, ingest::{self, accounts, bank, callback, profiles}, mcp, net, secrets, transfers, web};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -239,9 +239,10 @@ enum Cmd {
 #[derive(Subcommand)] enum BankCmd { /// Start a bank authorisation (opens the bank's login page)
     Connect { #[arg(long)] bank: String, /// ISO country code of the bank (BE)
         #[arg(long, default_value = "BE")] country: String, #[arg(long, default_value_t = 180)] days: i64, /// connect although a live consent exists
-        #[arg(long)] replace: bool, #[arg(long)] no_browser: bool },
+        #[arg(long)] replace: bool, #[arg(long)] no_browser: bool, /// paste the redirect address although [callback] enabled = true
+        #[arg(long)] no_server: bool },
     /// Renew the consent of a connected bank (bank name or session id)
-    Reconnect { target: String, #[arg(long, default_value_t = 180)] days: i64, #[arg(long)] no_browser: bool },
+    Reconnect { target: String, #[arg(long, default_value_t = 180)] days: i64, #[arg(long)] no_browser: bool, #[arg(long)] no_server: bool },
     /// Finish an authorisation with the address the browser shows after the bank login
     Finish { url: Option<String>, /// store the saved answer of a failed completion again (no bank call)
         #[arg(long)] replay: Option<String> },
@@ -391,11 +392,19 @@ fn run() -> Result<()> {
                 ClsCmd::Correct { key, category, name } => println!("labelled {key} as {category} ({} transaction(s))", llm::correct(&con, &rules, &key, &category, name.as_deref())?),
             } }
         Cmd::Bank(b) => { let con = open(true)?; let http = net::UreqHttp::new(60);
-            let finish = |cl: &bank::Client, state: &str| -> Result<()> { println!("\nAfter the bank login your browser lands on the redirect address (it may show an error page). Paste that whole address here and press Enter:"); let mut line = String::new(); std::io::stdin().read_line(&mut line)?; let (code, st) = bank::parse_finish_arg(cl.con, &line)?; if st.as_deref().is_some_and(|x| x != state) { anyhow::bail!("that address belongs to another authorisation"); } print_session(&bank::complete_auth(cl, &code, Some(st.as_deref().unwrap_or(state)))?); Ok(()) };
+            let paste = |cl: &bank::Client, state: &str| -> Result<()> { println!("\nAfter the bank login your browser lands on the redirect address (it may show an error page). Paste that whole address here and press Enter:"); let mut line = String::new(); std::io::stdin().read_line(&mut line)?; let (code, st) = bank::parse_finish_arg(cl.con, &line)?; if st.as_deref().is_some_and(|x| x != state) { anyhow::bail!("that address belongs to another authorisation"); } print_session(&bank::complete_auth(cl, &code, Some(st.as_deref().unwrap_or(state)))?); Ok(()) };
+            // The opt-in local HTTPS callback, bound BEFORE the bank login starts; any failure falls back to pasting the address.
+            let server = |no_server: bool| -> Option<(std::net::TcpListener, std::sync::Arc<rustls::ServerConfig>, String)> { if no_server || !cfg.callback_enabled { return None; }
+                let r = (|| -> Result<_> { let (port, path) = callback::parse_redirect(cfg.eb_redirect_url.as_deref().unwrap_or(""))?; let tls = callback::tls_config(&cfg.data_dir.join("tls"))?; Ok((callback::bind(port)?, tls, path)) })();
+                r.map_err(|e| eprintln!("The local callback did not start ({e:#}): paste the address instead.")).ok() };
+            let finish = |cl: &bank::Client, state: &str, srv: Option<(std::net::TcpListener, std::sync::Arc<rustls::ServerConfig>, String)>| -> Result<()> {
+                let Some((l, tls, path)) = srv else { return paste(cl, state) };
+                println!("\nWaiting up to {} s for the bank to send your browser back to {} (Ctrl+C to stop). The browser warns once about finch's self-signed certificate for localhost: accept it to continue.", cfg.callback_timeout, cfg.eb_redirect_url.as_deref().unwrap_or(""));
+                match callback::serve(&l, tls, &path, std::time::Duration::from_secs(cfg.callback_timeout as u64), |q| bank::callback_outcome(cl, state, q))? { Some(info) => { print_session(&info); Ok(()) } None => { drop(l); println!("No redirect arrived within {} s.", cfg.callback_timeout); paste(cl, state) } } };
             let open_url = |url: &str, no_browser: bool| { println!("Open this address to log in at your bank:\n  {url}"); if !no_browser { let _ = open_browser(url); } };
             match b {
-                BankCmd::Connect { bank: name, country, days, replace, no_browser } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let (state, url) = bank::start_auth(&cl, &name, &country, days, None, replace)?; open_url(&url, no_browser); finish(&cl, &state)?; }
-                BankCmd::Reconnect { target, days, no_browser } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let c = bank::find_session(&con, &target)?; let (state, url) = bank::start_auth(&cl, &c.bank, &c.country, days, Some(&c.session_id), true)?; open_url(&url, no_browser); finish(&cl, &state)?; }
+                BankCmd::Connect { bank: name, country, days, replace, no_browser, no_server } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let srv = server(no_server); let (state, url) = bank::start_auth(&cl, &name, &country, days, None, replace)?; open_url(&url, no_browser); finish(&cl, &state, srv)?; }
+                BankCmd::Reconnect { target, days, no_browser, no_server } => { let cl = bank::Client::from_config(&cfg, &con, &http)?; let c = bank::find_session(&con, &target)?; let srv = server(no_server); let (state, url) = bank::start_auth(&cl, &c.bank, &c.country, days, Some(&c.session_id), true)?; open_url(&url, no_browser); finish(&cl, &state, srv)?; }
                 BankCmd::Finish { url, replay } => { if let Some(st) = replay { print_session(&bank::replay_auth(&con, &st)?); } else { let cl = bank::Client::from_config(&cfg, &con, &http)?; let (code, st) = bank::parse_finish_arg(&con, url.as_deref().ok_or_else(|| anyhow::anyhow!("give the redirect address, or --replay STATE"))?)?; print_session(&bank::complete_auth(&cl, &code, st.as_deref())?); } }
                 BankCmd::Consents { refresh } => { if refresh { let cl = bank::Client::from_config(&cfg, &con, &http)?; for n in bank::refresh_live(&cl)? { println!("{n}"); } } println!("{}", bank::format_consents(&bank::list_consents(&con, false)?)); }
             } }

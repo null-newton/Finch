@@ -8,6 +8,8 @@ config.toml
 *.db-*
 *.bak
 secrets/
+tls/
+localhost.key
 hygiene-terms*
 web/node_modules/
 web/dist/
