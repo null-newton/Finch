@@ -15,6 +15,7 @@ const GENERIC_REFUSAL: &str = "refused; details withheld by the privacy filter -
 mod memory_tools;
 mod wealth_tools;
 mod people;
+mod skill_tools;
 
 pub struct Tool { pub name: &'static str, pub description: String, pub schema: Value }
 /// The tools that write something (a sealed proposal, a stored offer or decision): never `readOnlyHint`.
@@ -59,6 +60,12 @@ pub fn tools() -> Vec<Tool> {
         Tool { name: "household_overview", description: format!("Who is in the household (pseudonyms and roles only, never names), which accounts each owns, and how many transactions belong to each person, to `joint` or to nobody. Start here before filtering any tool by `member`.{DATA_NOTE}"), schema: plain(json!({})) },
         Tool { name: "kids_money", description: format!("The children's money: the regular pocket money (amount, rhythm, source), the extra top-ups with their source, spending by category and month, the balance trend (estimated) and the pocket-money versus extra ratio, plus the kid budgets. One child (`member`) or all of them. A parent's top-up is an internal transfer for the household but income for the child.{DATA_NOTE}"), schema: plain(json!({"member": {"type": "string", "maxLength": 40}, "months": {"type": "integer", "minimum": 1, "maximum": 24}})) },
         Tool { name: "who_pays", description: format!("Shared costs split by the household's allocation rules (equal, by income, custom percentages): each member's share, what they paid and the settlement per rule. It reports a split; it never moves money.{DATA_NOTE}"), schema: plain(json!({"months": {"type": "integer", "minimum": 1, "maximum": 36}})) },
+        Tool { name: "savings_estimate", description: format!("Net saving of switching a recurring service to a cheaper offer: monthly and yearly saving, net over `months` after the switching costs, break-even. The prices are the ones you give (dated and sourced); a `quote_date` older than 30 days is flagged. A pure calculator: nothing is stored or switched.{DATA_NOTE}"),
+            schema: json!({"type": "object", "properties": {"current_monthly": {"type": "number", "minimum": 0, "maximum": 100000}, "alternative_monthly": {"type": "number", "minimum": 0, "maximum": 100000}, "switching_costs": {"type": "number", "minimum": 0, "maximum": 100000}, "months": {"type": "integer", "minimum": 1, "maximum": 120}, "quote_date": date}, "required": ["current_monthly", "alternative_monthly"], "additionalProperties": false}) },
+        Tool { name: "mortgage_check", description: format!("Mortgage review on the stored amortization schedule (Belgian rules): capital still due, interest by year, the legal maximum reinvestment indemnity (3 months of interest), a renegotiation estimate (`variant` internal = same lender, external = refinancing elsewhere) at a market rate YOU give (`market_rate_pct` + `market_rate_date`, flagged when older than 30 days; never looked up), and a borrower-insurance switch at a quote you give (`alternative_insurance_monthly`). Missing fields are listed in `what_i_need`, never guessed. Loans by kind and ref only; no lender is ever recommended. Estimates, not offers.{DATA_NOTE}"),
+            schema: plain(json!({"loan": {"type": "string", "maxLength": 20, "description": "loan-N (default: every mortgage)"}, "market_rate_pct": {"type": "number", "minimum": 0, "maximum": 25}, "market_rate_date": date, "variant": {"type": "string", "enum": ["internal", "external"]},
+                "bank_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "guarantee_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "other_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "penalty": {"type": "number", "minimum": 0, "maximum": 1000000, "description": "the early-repayment indemnity the contract states, instead of the legal cap"},
+                "alternative_insurance_monthly": {"type": "number", "minimum": 0, "maximum": 10000}, "insurance_fees": {"type": "number", "minimum": 0, "maximum": 10000}})) },
     ]
 }
 
@@ -110,7 +117,7 @@ impl Session {
                 let r = if name == "memory_propose" { memory_tools::propose(&self.cfg, red, a, self.suspicious) } else { memory_tools::questions_propose(&self.cfg, red, ds, a, self.suspicious, today) };
                 if r.as_ref().is_ok_and(|v| v["proposal_id"].is_string()) { self.proposals += 1; } return r; }
             _ => {} }
-        match name { "net_worth" => return wealth_tools::net_worth(ds, red, con, a), "loans_overview" => return wealth_tools::loans_overview(ds, red, a), "rental_overview" => return Ok(wealth_tools::rental_overview(ds, red)),
+        match name { "net_worth" => return wealth_tools::net_worth(ds, red, con, a), "mortgage_check" => return wealth_tools::mortgage_check(ds, red, a), "savings_estimate" => return skill_tools::savings_estimate(a, today).map(|v| red.walk(&v, None)), "loans_overview" => return wealth_tools::loans_overview(ds, red, a), "rental_overview" => return Ok(wealth_tools::rental_overview(ds, red)),
             "subscriptions_inventory" | "cancellability" | "alternatives_record" | "savings_tracker" => { let rec = recurring::detect(ds, &Scope::default(), true); return match name { "cancellability" => wealth_tools::cancellability(ds, &rec, red, a), "alternatives_record" => wealth_tools::alternatives_record(ds, &rec, red, con, a),
                 "savings_tracker" => wealth_tools::savings_tracker(&rec, red, con, today), _ => Ok(wealth_tools::subscriptions(ds, &rec, red, con, a)) }; }
             "decision_propose" | "contracts_draft" => { if self.proposals >= memory_tools::MAX_PROPOSALS { return Err(format!("at most {} proposals per session: ask the user to review the pending ones first", memory_tools::MAX_PROPOSALS)); } let rec = recurring::detect(ds, &Scope::default(), true);
