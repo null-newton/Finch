@@ -36,8 +36,9 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
   `TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)` exist, that the repository stays public (the updater needs it), and when to cut v0.1.0.
 - **B9 Belgian tax helper [decided: port a Belgian version, candidates only; agent].** The Python `tax_candidates` is FR / IT. Port a Belgian version (which deductions:
   mortgage / woonbonus, pension saving, childcare, gifts, service vouchers?) or drop it. Candidates only, never advice.
-- **B10 The two "not ported" choices [decided: web enrichment stays out; build the local HTTPS bank callback; agent. Owner registers the redirect address in the Enable Banking application].** Keep them out (web enrichment of merchants; local HTTPS bank callback) or build
-  the callback (needs the redirect address registered in the Enable Banking application).
+- **B10 The two "not ported" choices [done 2026-11-24: web enrichment stays out; local HTTPS bank callback built, opt-in; owner registers the redirect address in the Enable Banking application].**
+  `src/ingest/callback.rs` (`[callback] enabled`, 127.0.0.1 only, self-signed certificate in `<data_dir>/tls/`, one valid request or
+  the timeout, paste as fallback); the owner's steps are in README "Bank login callback". The web app's connect still asks to paste.
 
 ## Follow-ups found by the audits
 

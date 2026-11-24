@@ -18,7 +18,7 @@ Python app, so both can work on the same data while the port is in progress.
 | Descriptor parsing: **Belgian banks** (NL / FR / EN), Revolut | new (replaces the French / Italian parsers) |
 | Categories: override, transfer link, type rules, user labels, Belgian merchant rules, entities, LLM labels, memory annotations, splits | ported |
 | LLM classification of merchants: person guard (default deny), redaction, towns cut, coarse amounts, kNN near-duplicates without the LLM, backends `claude-code` / `anthropic-api` / `ollama` / `openai-compatible`, usage log, `--dry-run`, review, user corrections | ported (phase 3); Anthropic Message Batches (`finch classify run --batch-api`, collect with `finch classify batches`: half price, resumable) added; web enrichment is not ported (it would send merchant names to a search service) |
-| Enable Banking: RS256 JWT client, consents (expiry, live status), connect / reconnect / finish (paste the redirect address; `--replay`), account matching across reconnects, sync (pages, dedup, pending, balances, daily limit), account merge | ported (phase 3); no local HTTPS callback server (it needs the redirect address registered in your Enable Banking application) |
+| Enable Banking: RS256 JWT client, consents (expiry, live status), connect / reconnect / finish (paste the redirect address; `--replay`), account matching across reconnects, sync (pages, dedup, pending, balances, daily limit), account merge | ported (phase 3); the local HTTPS callback is opt-in (`[callback] enabled = true`, see [Bank login callback](#bank-login-callback)), pasting the address stays the default and the fallback |
 | Egress policy: one check before every outbound call, `[privacy] offline` / `local_only`, local journal (host and purpose only) | ported (phase 3) |
 | Analytics: coverage model, cash flow, category averages | ported (phase 1) |
 | Internal-transfer matching: auto-link (opt-in), proposals, ambiguous pairs, manual link / unlink, cross-bank window, member evidence | ported (phase 2) |
@@ -45,7 +45,7 @@ Python app, so both can work on the same data while the port is in progress.
 | Documents: `finch memory doc add|list|extract`: hashed storage in `memory/documents/`, text read locally (PDF text layer or text file, no OCR), redaction (IBAN, card / account numbers, e-mails, phones, household names, addresses), the exact request shown, `--send` asks the model, each field checked against a snippet of the text, the result is a proposal | ported |
 | Web app (`web/`) | restyled with the toolbox look (Manrope / DM Mono, ink-teal and lime, drafting grid); pages and interactions unchanged; the bank connection asks you to paste the redirect address |
 
-Not ported: web enrichment of merchant names (it sends merchant names to a search service, which finch does not do) and the local HTTPS callback for the bank login (paste the redirect address instead). The web app edits memory for the person at the keyboard; a model only ever proposes.
+Not ported: web enrichment of merchant names (it sends merchant names to a search service, which finch does not do). The web app edits memory for the person at the keyboard; a model only ever proposes.
 
 ## Desktop app
 
@@ -87,6 +87,25 @@ Without perl (SQLCipher) try it plain on a scratch home: `FINCH_FEATURES=keychai
 
 `.github/workflows/check.yml` runs the web tests and build, clippy and the Rust tests on every push to `main` and every pull request.
 The repository must stay public for the updater to fetch `latest.json` without a login.
+
+## Bank login callback
+
+By default `finch bank connect` / `reconnect` ask you to paste the address the browser lands on after the bank login. Opt in to
+let finch receive it itself:
+
+1. In the Enable Banking control panel, add the **exact** redirect address to your application, for example
+   `https://localhost:8443/callback` (scheme, host, port and path must match character for character).
+2. In `config.toml`: `[enable_banking] redirect_url = "https://localhost:8443/callback"` and `[callback] enabled = true`
+   (optional `timeout_seconds = 600`). The port and path come from `redirect_url`; the host must be `localhost` or `127.0.0.1`.
+3. Run `finch bank connect --bank KBC`. finch listens on 127.0.0.1 only, logs in at the bank in your browser, and on the
+   redirect checks the one-time `state`, finishes the consent exactly like `finch bank finish`, shows "Bank connected" and stops.
+   A request with another state is answered "not this login" and the server keeps waiting; one valid request or the timeout ends it.
+4. **The browser warns once** ("Your connection is not private"): the certificate is self-signed, generated locally on first use
+   into `<data_dir>/tls/` (`localhost.crt`, `localhost.key`, owner-only, renewed before it expires; never commit it). Choose
+   "Advanced" > "Proceed to localhost". Nothing it receives is logged and it makes no outbound call.
+
+If the port is taken, the certificate cannot be made, or nothing arrives in time, finch falls back to the paste prompt (the login
+stays valid); `--no-server` always pastes.
 
 ## Belgian banks
 
@@ -143,7 +162,7 @@ finch forecast --days 60
 finch budgets status
 finch calendar
 finch refresh                    # the daily analytics step
-finch bank connect --bank KBC     # log in at the bank, then paste the address the browser lands on
+finch bank connect --bank KBC     # log in at the bank, then paste the address the browser lands on (or the local callback receives it)
 finch sync                       # new transactions and balances (normalised automatically)
 finch classify run --dry-run     # the exact redacted requests; without --dry-run they are sent
 finch classify review            # held-back (possible people) and low-confidence merchants

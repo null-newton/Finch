@@ -1,5 +1,6 @@
 //! Enable Banking: the REST client (RS256 JWT, the private key never leaves the machine), the consent lifecycle, the connect /
-//! finish flow (the bank redirects the browser; you paste the redirect address: `finch bank finish '<url>'`, the code is single-use
+//! finish flow (the bank redirects the browser; you paste the redirect address: `finch bank finish '<url>'`, or the opt-in local
+//! HTTPS callback in `callback.rs` receives it; the code is single-use
 //! and the /sessions answer is saved first so `--replay STATE` can store it again), session storage with one-to-one account
 //! matching across reconnects (an ambiguous match is created `needs_review`, never merged silently), and the transaction sync
 //! (pagination, dedup by bank reference or content, pending replacement, balances, a daily limit per account).
@@ -100,6 +101,14 @@ pub fn parse_finish_arg(con: &Connection, text: &str) -> Result<(String, Option<
     if let Some(s) = &state { if con.query_row("SELECT 1 FROM pending_auth WHERE state=?", [s], |_| Ok(())).optional()?.is_none() { bail!("Unknown state in the redirect address: not started by this tool"); } }
     if let Some(e) = q.get("error") { bail!("The bank returned an error ({}): nothing was connected. Run connect again.", truncate_chars(e, 60)); }
     Ok((q.get("code").cloned().ok_or_else(|| anyhow::anyhow!("the address has no ?code=... part: paste the WHOLE address the browser shows after the bank login"))?, state))
+}
+/// One redirect on the local callback: a missing or foreign state keeps waiting (consumes nothing), a bank error or a missing code
+/// ends it, otherwise the code is completed exactly like `finch bank finish`.
+pub fn callback_outcome(c: &Client, state: &str, q: &HashMap<String, String>) -> super::callback::Outcome<Value> {
+    use super::callback::Outcome::*;
+    if q.get("state").map(String::as_str) != Some(state) { return Wait("This address does not belong to the login the terminal is waiting for (unknown or already used state).".into()); }
+    if let Some(e) = q.get("error") { return Done(Err(format!("The bank returned an error ({}): nothing was connected. Run connect again.", truncate_chars(e, 60)))); }
+    match q.get("code") { None => Done(Err("The redirect carried no authorisation code: nothing was connected. Run connect again.".into())), Some(code) => Done(complete_auth(c, code, Some(state)).map_err(|e| format!("{e:#}"))) }
 }
 /// Exchange the single-use code for a session and store it; the raw answer is saved BEFORE it is interpreted (replayable).
 pub fn complete_auth(c: &Client, code: &str, state: Option<&str>) -> Result<Value> {

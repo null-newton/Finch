@@ -3,6 +3,7 @@
 //! difference, and genuine same-day same-amount same-label purchases are kept.
 pub mod accounts;
 pub mod bank;
+pub mod callback;
 pub mod fingerprint;
 pub mod parsers;
 pub mod profiles;
