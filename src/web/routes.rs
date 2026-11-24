@@ -20,7 +20,7 @@ pub fn route(a: &App, r: &Req) -> R {
         ("POST", ["session", "logout"]) => { a.sec.revoke(r.cookie.as_deref()); Ok(Resp::json(json!({"ok": true})).header("Set-Cookie", &a.sec.clear_cookie())) }
         ("GET", ["session", "methods"]) => ok(json!({"passkeys": false, "sso": false, "sso_sign_out": null})),
         ("GET", ["meta", "taxonomy"]) => ok(taxonomy(&rules(a)?)),
-        ("GET", ["meta", "disclaimers"]) => ok(disclaimers(r.q("lang").unwrap_or("en"))),
+        ("GET", ["meta", "disclaimers"]) => ok(crate::disclaimers::texts(r.q("lang").unwrap_or("en"))),
         ("GET", ["meta", "filters"]) => filters(a),
         ("GET", ["health"]) => ok(health(a, &a.con()?)?),
         ("GET", ["analytics", "coverage"]) => { let s = a.view(r)?; ok(analytics::coverage(&s.ds)) }
@@ -170,16 +170,6 @@ fn taxonomy(rules: &Rules) -> Value {
     let mut groups: Vec<(String, Vec<Value>)> = vec![];
     for (id, desc) in &rules.categories { let g = id.split('.').next().unwrap_or(id).to_string(); if groups.last().is_none_or(|x| x.0 != g) { groups.push((g.clone(), vec![])); } groups.last_mut().unwrap().1.push(json!({"id": id, "description": desc})); }
     json!({"groups": groups.into_iter().map(|(g, c)| json!({"id": g, "categories": c})).collect::<Vec<_>>()})
-}
-/// The legal labels the web shows itself (its locale files never copy them). Belgian sources.
-fn disclaimers(lang: &str) -> Value {
-    let code = match lang.get(..2).unwrap_or("en").to_lowercase().as_str() { "fr" => "fr", "it" => "it", _ => "en" };
-    json!({"lang": code, "texts": {"ai_label": "AI-generated content: it can contain mistakes. Check the figures against your accounts.", "ai_label_short": "AI-generated",
-        "contract": "General summary of consumer-law rules, not legal advice: the contract's own terms and your situation decide. Verify with your contract and the official source (FPS Economy, your provider or insurer) before sending anything.",
-        "contract_verify": "Verify with your contract and the official source before acting: this is a general summary, not legal advice.", "general_advice": "This is general information, not financial advice.",
-        "loan": "Estimate from the figures you gave, not an offer: your bank or a broker gives the binding numbers. General information, not financial advice; no product is recommended.",
-        "tax": "General information, not tax advice: rules, rates and ceilings change every year and depend on your situation. Verify on the official site (FPS Finance / MyMinfin) or with an adviser before declaring anything. Nothing is filed by finch.",
-        "tax_short": "General information, not tax advice."}})
 }
 fn filters(a: &App) -> R {
     let s = a.snap()?; let ds = &s.ds; let members = memory::members(&a.cfg.memory_dir);

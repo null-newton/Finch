@@ -83,6 +83,7 @@ enum Cmd {
     #[command(subcommand)] Loans(LoanCmd),
     #[command(subcommand)] Subs(SubsCmd),
     #[command(subcommand)] Rental(RentCmd),
+    #[command(subcommand)] Tax(TaxCmd),
     #[command(subcommand)] Questions(QCmd),
     Ui { #[arg(long)] host: Option<String>, #[arg(long)] port: Option<u16>, /// API only: the page comes from `pnpm dev` (port 5173)
         #[arg(long)] dev: bool, #[arg(long)] no_browser: bool, /// print a fresh one-time login link for a running `finch ui` and exit
@@ -171,6 +172,8 @@ enum Cmd {
     List,
     /// One property: months, yearly totals, rent indexation
     Show { id: String, #[arg(long)] year: Option<i32> } }
+#[derive(Subcommand)] enum TaxCmd { /// Candidate items for the Belgian income tax return of an income year (a reminder list: not a return, not advice)
+    Candidates { #[arg(long)] year: Option<i32>, #[command(flatten)] out: Out } }
 #[derive(Subcommand)] enum DocCmd { /// Attach a document (contract, loan offer...) to the memory
     Add { file: std::path::PathBuf, #[arg(long)] kind: String, #[arg(long)] note: Option<String>, #[arg(long)] dry_run: bool },
     /// The attached documents
@@ -447,6 +450,12 @@ fn run() -> Result<()> {
             } }
         Cmd::Rental(c) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?;
             match c { RentCmd::List => print_json(&finch::rental::list(&ds)), RentCmd::Show { id, year } => print_json(&finch::rental::detail(&ds, &id, year).ok_or_else(|| anyhow::anyhow!("no rental property {id:?}"))?) } }
+        Cmd::Tax(TaxCmd::Candidates { year, out }) => { let con = open(true)?; let ds = Dataset::load(&con, &cfg, None)?; let v = finch::tax::candidates(&ds, year).map_err(|e| anyhow::anyhow!(e))?;
+            if out.json { print_json(&v); } else { println!("{}\n", s(&v["income_year_note"]));
+                for c in v["candidates"].as_array().into_iter().flatten() { println!("{}  [{}]{}", s(&c["heading"]), s(&c["id"]), c["spent"].as_str().map_or(String::new(), |x| format!("  spent {x} EUR in {} payment(s)", c["n_tx"])));
+                    for m in c["missing_info"].as_array().into_iter().flatten() { println!("    missing: {}", s(m)); } for d in c["documents_to_keep"].as_array().into_iter().flatten() { println!("    keep: {}", s(d)); } }
+                for n in v["no_data_for"].as_array().into_iter().flatten() { println!("no data for {}: {}", s(&n["id"]), s(&n["how"])); }
+                println!("\n{}\n{}\n\n{}", s(&v["ceilings"]), s(&v["verify"]), s(&v["disclaimer"])); } }
         Cmd::Backup(b) => match b {
             BackupCmd::Create => { let con = open(true)?; let (p, pruned) = finch::backup::create(&cfg, &con, None)?; println!("backup written and verified: {}", p.display()); for x in pruned { println!("pruned {}", x.display()); } }
             BackupCmd::List => for p in finch::backup::list(&cfg) { println!("{}  {} bytes", p.display(), std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)); },

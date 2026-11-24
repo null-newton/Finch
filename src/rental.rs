@@ -104,7 +104,7 @@ pub fn detail(ds: &Dataset, id: &str, year: Option<i32>) -> Option<Value> {
 /// Belgium: private residential letting is taxed on the indexed cadastral income, not on the rents received.
 pub fn tax(year: i32) -> Value {
     json!({"year": year, "country": "BE", "status": "not_applicable", "note": "In Belgium, letting a home privately to a private tenant is taxed on the property's indexed cadastral income (KI / RC), not on the rents: no rent-based figure is computed. Professional letting or furnished letting differ: ask an adviser.",
-        "disclaimer": "General information, not tax advice: rules change and depend on your situation. Verify on the official site (FPS Finance / MyMinfin) or with an adviser.", "disclaimer_key": "tax"})
+        "disclaimer": crate::disclaimers::TAX, "disclaimer_key": "tax"})
 }
 
 #[cfg(test)]

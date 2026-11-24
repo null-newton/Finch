@@ -23,7 +23,7 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 - **B5 MCP tool parity [agent].** The Python server has tools finch lacks (e.g. `explain_transaction`, `memory_context`,
   `monthly_review`, `explain_spike`, `what_if`, `mortgage_check`, `savings_estimate`, `subscription_audit`, `onboarding_status`).
   Audit against `../src/coach/mcp/`, port the missing ones through `mcp::Session::publish`, a leak assertion each in `tests/e2e.rs`.
-  `tax_candidates` is excluded until B9 is decided.
+  `tax_candidates` is done (B9, Belgian version).
 - **B6 Migration numbering audit [done: `migrations/README.md`; follow-up B12].** finch has 0001–0024 with gaps (0007, 0010, 0020, 0023, ...). Check each gap against the
   Python `migrations/` and record in `migrations/README.md` why it is absent (data migration rewritten in Rust, not applicable, ...).
 
@@ -34,8 +34,12 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
   wrong merchant, as *synthetic look-alikes* (never a real line). Agents then add tests and adjust patterns.
 - **B8 Release readiness [decided: secrets are set; cut v0.1.0 only after B4/B5 land].** The updater pubkey is set in `desktop/tauri.conf.json`; confirm the repository secrets
   `TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)` exist, that the repository stays public (the updater needs it), and when to cut v0.1.0.
-- **B9 Belgian tax helper [decided: port a Belgian version, candidates only; agent].** The Python `tax_candidates` is FR / IT. Port a Belgian version (which deductions:
-  mortgage / woonbonus, pension saving, childcare, gifts, service vouchers?) or drop it. Candidates only, never advice.
+- **B9 Belgian tax helper [done 2026-11-24: `src/tax.rs`, `finch tax candidates --year`, MCP `tax_candidates`; owner checks the legal wording].** Candidates only, never advice:
+  pension saving (descriptor PENSIOENSPAREN / EPARGNE-PENSION, tag `pension_saving`, asset kind `pension`), long-term saving (`insurance.life`, tag `long_term_saving`,
+  asset kind `life_insurance_savings`), childcare (`kids.childcare`, tag `childcare`), gifts (`charity.donations`, tag `approved_gift`), service vouchers
+  (`housing.household_help`, tag `service_vouchers`; regional), home loan (`housing.mortgage`, `insurance.borrower`, tag `home_loan`, mortgage liabilities with the
+  year from their schedule; flag only), rental cadastral income (always listed as missing). Optional `region: flanders|wallonia|brussels` in household.yaml.
+  No rate or ceiling is quoted; disclaimers now live in `src/disclaimers.rs`. Follow-up: a web page / endpoint for it is not built (B4 if wanted).
 - **B10 The two "not ported" choices [done 2026-11-24: web enrichment stays out; local HTTPS bank callback built, opt-in; owner registers the redirect address in the Enable Banking application].**
   `src/ingest/callback.rs` (`[callback] enabled`, 127.0.0.1 only, self-signed certificate in `<data_dir>/tls/`, one valid request or
   the timeout, paste as fallback); the owner's steps are in README "Bank login callback". The web app's connect still asks to paste.
