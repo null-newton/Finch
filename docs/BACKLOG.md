@@ -41,7 +41,7 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 
 ## Follow-ups found by the audits
 
-- **B12 Migration and home fixes [agent].** `m0023` in `src/db.rs`: fall back to `transaction_date` when `value_date` is empty or null
+- **B12 Migration and home fixes [done: `m0023` matches Python; the root lookup stops at the finch crate; `mcp serve` logs its home].** `m0023` in `src/db.rs`: fall back to `transaction_date` when `value_date` is empty or null
   (as Python does), and treat a non-string `status` like Python. `config::find_root` walks up into the parent Python repo (its
   `config.example.toml`) and could open the Python app's database: stop at finch's own root, and log the chosen home on `mcp serve`.
 

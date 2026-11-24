@@ -37,6 +37,5 @@ Python's (line endings aside). A new migration takes the next number in both app
 point, and one the Python app migrated already ran it. Only a Python database below version 20 with insights, opened first by finch,
 would skip it.
 
-(2) Differs on one edge: Python takes `value_date or transaction_date`, so an empty or `null` `value_date` falls back to
-`transaction_date`; `m0023` falls back only when the `value_date` key is absent, so such a row moves to pending instead of keeping a date.
-A non-string `status` also counts as booked in Rust but as not booked in Python.
+(2) Same semantics as Python (B12): `value_date or transaction_date` with Python truthiness (an empty or `null` `value_date` falls back to
+`transaction_date`), and a row is booked only when `status` is absent, `null`, empty or `BOOK` (a non-string `status` moves it to pending).
