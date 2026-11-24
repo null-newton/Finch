@@ -10,13 +10,17 @@ fn rf(map: &[(String, String)], id: &str) -> String { map.iter().find(|x| x.0 ==
 fn back(map: &[(String, String)], r: &str) -> Option<String> { map.iter().find(|x| x.1 == r).map(|x| x.0.clone()) }
 const NOTE: &str = "Items are given by kind and ref only. An item listed under `unknown` has no recorded figure: never estimate it; say it is missing and offer to propose it (memory_propose).";
 
-pub fn net_worth(ds: &Dataset, red: &Redactor) -> Value {
+pub fn net_worth(ds: &Dataset, red: &Redactor, con: &rusqlite::Connection, a: &Value) -> Result<Value, String> {
     let (am, lm) = refs(ds); let v = loans::net_worth(ds, ds.today, ds.settings.asset_stale_months as i32);
     let raw = json!({"as_of": v["as_of"], "net_worth": v["net_worth"], "complete": v["complete"], "n_unknown": v["n_unknown"], "by_category": v["by_category"], "by_owner": v["by_owner"], "bank_total": v["bank"]["total"],
         "assets": v["assets"]["items"].as_array().into_iter().flatten().map(|a| json!({"ref": rf(&am, a["id"].as_str().unwrap_or("")), "kind": a["kind"], "category": a["category"], "value": a["value"], "as_of": a["as_of"], "stale": a["stale"], "counted": a["counted"]})).collect::<Vec<_>>(),
         "liabilities": v["liabilities"]["items"].as_array().into_iter().flatten().map(|l| json!({"ref": rf(&lm, l["id"].as_str().unwrap_or("")), "kind": l["kind"], "outstanding": l["outstanding"], "source": l["source"], "stale": l["stale"], "counted": l["counted"]})).collect::<Vec<_>>(),
         "unknown": v["unknown"].as_array().into_iter().flatten().map(|u| { let k = u["kind"].as_str().unwrap_or(""); json!({"type": k, "ref": match k { "asset" => rf(&am, u["id"].as_str().unwrap_or("")), "liability" => rf(&lm, u["id"].as_str().unwrap_or("")), _ => "account".into() }, "reason": u["reason"]}) }).collect::<Vec<_>>(), "note": NOTE});
-    red.walk(&raw, None)
+    let mut out = red.walk(&raw, None);
+    if a["history"] == true { let h = crate::loans_extra::history(con, a["months"].as_i64().unwrap_or(24)).map_err(|e| format!("net_worth failed ({})", e.root_cause()))?;
+        out["history"] = h.iter().map(|p| json!({"month": p["month"], "as_of": p["as_of"], "source": p["source"], "net_worth": p["net_worth"], "assets": p["assets"], "liabilities": p["liabilities"], "by_category": p["by_category"], "n_unknown": p["n_unknown"], "complete": p["complete"]})).collect::<Vec<_>>().into();
+        out["history_note"] = "one point per month: the latest snapshot recorded that month (`finch loans snapshot`); a month with n_unknown > 0 is the known part only. Nothing is recorded by this tool.".into(); }
+    Ok(out)
 }
 pub fn loans_overview(ds: &Dataset, red: &Redactor, a: &Value) -> Result<Value, String> {
     let (_, lm) = refs(ds); let only = a["loan"].as_str().map(|r| back(&lm, r).ok_or("unknown loan: use a ref from net_worth or loans_overview (loan-N)")).transpose()?;

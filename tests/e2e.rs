@@ -134,4 +134,9 @@ fn phase2_recurring_prices_anomalies_transfers_forecast() {
         for leak in ["Quuxcorp", "QUUXCORP", "imp-zicht", "BE68", "BE12 3456", "BE12ZZZ"] { assert!(!r.text.contains(leak), "{tool} leaked {leak}: {}", r.text); }
     }
     assert!(!s.call("calendar", &json!({"account": "account-other-1"})).ok, "calendar takes no account scope");
+    for tool in ["budget_status", "calendar", "goals"] { let r = s.call(tool, &json!({"member": "adult-1"})); assert!(r.ok, "{tool} takes a member: {}", r.text); }
+    assert!(!s.call("goals", &json!({"member": "zorro"})).ok, "a real member id is refused");
+    let l = mcp::listing(); let ro = |n: &str| l["tools"].as_array().unwrap().iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} not listed"))["annotations"]["readOnlyHint"].clone();
+    for w in mcp::WRITERS { assert_eq!(ro(w), false, "{w} writes"); } assert_eq!(ro("coverage"), true);
+    let nw = s.call("net_worth", &json!({"history": true, "months": 6})); assert!(nw.ok && nw.data["history"].is_array(), "{}", nw.text);
 }
