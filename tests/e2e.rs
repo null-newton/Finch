@@ -135,3 +135,40 @@ fn phase2_recurring_prices_anomalies_transfers_forecast() {
     }
     assert!(!s.call("calendar", &json!({"account": "account-other-1"})).ok, "calendar takes no account scope");
 }
+
+#[test]
+fn belgian_tax_candidates_from_own_data_only() {
+    let tmp = tempfile::tempdir().unwrap(); let (dir, m) = (tmp.path(), tmp.path().join("memory")); std::fs::create_dir_all(m.join("liabilities")).unwrap();
+    std::fs::write(dir.join("config.toml"), "insecure_plaintext_db = true\n").unwrap();
+    std::fs::write(m.join("household.yaml"), "region: Vlaanderen\nmembers:\n  - id: zorro\n    name: Zorro Testmans\n    role: adult\n  - id: kiki\n    name: Kiki Testmans\n    role: child\n    birth_year: 2021\n  - id: bobo\n    name: Bobo Testmans\n    role: child\n").unwrap();
+    std::fs::write(m.join("categorization.yaml"), "annotations:\n  - id: speelplein\n    match:\n      description: 'SPEELPLEINWERKING'\n    category: kids.activities_toys\n    tags: [childcare]\n").unwrap();
+    std::fs::write(m.join("assets.yaml"), "assets:\n  - id: studio-zeedijk\n    kind: real_estate_rental\n    description: Studio Zeedijk\n    value: 180000\n    account: Verhuur\n  - id: pensioen-demo\n    kind: pension\n    provider: Pensiobank Demo\n").unwrap();
+    std::fs::write(m.join("liabilities/hypotheek.yaml"), "id: hypotheek\nkind: mortgage\nlender: Testbank Hypotheek NV\nprincipal: 200000\nrate: {type: fixed, nominal: 3}\nstart_date: 2024-01-10\nterm_months: 240\n").unwrap();
+    let cfg = config::load_config(Some(&dir.join("config.toml"))).unwrap(); let con = db::connect(&cfg, db::Opts { insecure: true, create: true, ..Default::default() }).unwrap();
+    let prof = ingest::profiles::from_toml(&include_str!("../assets/import_profiles/generic-csv-be-nl.toml").parse().unwrap(), "x").unwrap();
+    let imp = |name: &str, rows: &str, acc: &str| { let f = dir.join(name); std::fs::write(&f, format!("Datum;Omschrijving;Bedrag\n{rows}")).unwrap(); ingest::import_file(&con, &f, ingest::ImportOpts { account: acc, profile: Some(&prof), fmt: None, dry_run: false, bank: Some("KBC"), currency: None, iban: None, force: false }).unwrap(); };
+    let mut rows = String::new();
+    for mo in 1..=12 { rows += &format!("05/{mo:02}/2025;EUROPESE DOMICILIERING SCHULDEISER : KINDEROPVANG ZONNEKIND MANDAAT NUMMER : KO1;-250,00\n"); }
+    rows += "20/12/2025;EUROPESE DOMICILIERING SCHULDEISER : DEMOBANK PENSIOENSPAARFONDS MANDAAT NUMMER : PS1;-1020,00\n10/06/2025;BETALING MET DEBETKAART UNICEF BELGIE;-60,00\n15/03/2025;BETALING MET DEBETKAART PLURALITY DIENSTENCHEQUES;-270,00\n";
+    rows += "12/07/2025;BETALING MET DEBETKAART SPEELPLEINWERKING DEMO;-40,00\n15/07/2024;BETALING MET DEBETKAART UNICEF BELGIE;-99,00\n02/01/2026;BETALING MET DEBETKAART UNICEF BELGIE;-77,00\n";
+    imp("main.csv", &rows, "new:Zicht"); imp("rent.csv", "02/02/2025;OVERSCHRIJVING VAN HUURDER DEMO HUUR STUDIO;650,00\n20/05/2025;ONROERENDE VOORHEFFING DEMO;-410,00\n", "new:Verhuur");
+    con.execute("UPDATE accounts SET purpose='rental' WHERE uid='imp-verhuur'", []).unwrap(); classify::normalize_all(&con, Some(&cfg.memory_dir)).unwrap();
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 10);
+    let ds = Dataset::load(&con, &cfg, today).unwrap(); let v = finch::tax::candidates(&ds, None).unwrap();
+    assert_eq!((v["year"].as_i64(), v["household"]["region"].as_str(), v["household"]["children"].as_u64()), (Some(2025), Some("flanders"), Some(2)), "default: last year; region from household.yaml");
+    let c = |id: &str| v["candidates"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap_or_else(|| panic!("no {id}: {v}")).clone();
+    assert_eq!(c("be-pension-saving")["spent"], "1020.00", "found by its descriptor; the pension asset is listed"); assert_eq!(c("be-pension-saving")["memory_items"], json!(["pensioen-demo"]));
+    assert_eq!(c("be-childcare")["spent"], "3040.00", "12 x 250 by category + 40 tagged childcare in memory"); assert!(c("be-childcare")["missing_info"].to_string().contains("birth year of 1 child"));
+    assert_eq!((c("be-gifts")["spent"].as_str(), c("be-gifts")["n_tx"].as_u64()), (Some("60.00"), Some(1)), "only the income year"); assert_eq!(c("be-service-vouchers")["spent"], "270.00");
+    let hl = c("be-home-loan"); assert_eq!(hl["spent"], serde_json::Value::Null, "no mortgage payment seen"); assert_eq!(hl["loans"][0]["year_from_schedule"]["instalments"], 12); assert!(hl["loans"][0]["year_from_schedule"]["interest"].as_str().is_some());
+    let rc = c("be-rental-cadastral"); assert_eq!(rc["spent"], "410.00"); assert!(rc["missing_info"][0].as_str().unwrap().contains("cadastral income"));
+    assert!(v["no_data_for"].as_array().unwrap().iter().any(|n| n["id"] == "be-long-term-saving"));
+    assert_eq!(v["disclaimer"], finch::disclaimers::TAX); assert!(v.to_string().contains("Tax-on-web"));
+    for c in v["candidates"].as_array().unwrap() { let t = c.to_string(); assert!(!t.contains('%'), "no rate is quoted: {t}"); }
+    assert!(finch::tax::candidates(&ds, Some(2027)).is_err());
+    // the MCP tool: refs and pseudonyms only
+    let mut s = mcp::Session::with(cfg, con, today); let r = s.call("tax_candidates", &json!({"year": 2025})); assert!(r.ok, "{}", r.text);
+    for leak in ["Testmans", "Zorro", "Kiki", "Bobo", "zorro", "kiki", "bobo", "Testbank", "Pensiobank", "pensioen-demo", "hypotheek", "Zeedijk", "zeedijk", "HUURDER", "imp-zicht", "imp-verhuur", "birth_year\":", "2021"] { assert!(!r.text.contains(leak), "{leak} leaked: {}", r.text); }
+    assert_eq!(r.data["candidates"].as_array().unwrap().iter().find(|c| c["id"] == "be-home-loan").unwrap()["loans"][0]["loan"], "loan-1");
+    assert!(r.text.contains("asset-1") && r.text.contains("kid-"), "{}", r.text); assert!(!s.call("tax_candidates", &json!({"year": 1999})).ok);
+}

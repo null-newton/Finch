@@ -77,3 +77,15 @@ pub fn savings_tracker(rec: &Recurring, red: &Redactor, con: &rusqlite::Connecti
     for d in v["decisions"].as_array_mut().into_iter().flatten() { if let Some(o) = d.as_object_mut() { o.remove("note"); } }
     Ok(red.walk(&v, None))
 }
+/// Belgian tax-return candidates: assets and loans by ref, children by pseudonym (never a name or a birth year).
+pub fn tax_candidates(ds: &Dataset, red: &Redactor, a: &Value) -> Result<Value, String> {
+    let (am, lm) = refs(ds); let mut v = crate::tax::candidates(ds, a["year"].as_i64().map(|y| y as i32))?;
+    for c in v["candidates"].as_array_mut().into_iter().flatten() {
+        if let Some(x) = c["asset"].as_str().map(|s| rf(&am, s)) { c["asset"] = x.into(); }
+        for it in c["memory_items"].as_array_mut().into_iter().flatten() { if let Some(x) = it.as_str().map(|s| rf(&am, s)) { *it = x.into(); } }
+        for l in c["loans"].as_array_mut().into_iter().flatten() { if let Some(x) = l["loan"].as_str().map(|s| rf(&lm, s)) { l["loan"] = x.into(); } }
+        for k in c["children"].as_array_mut().into_iter().flatten() { if let Some(x) = k["member"].as_str().map(|s| super::people::fwd(red, s)) { k["member"] = x.into(); } }
+    }
+    let mut out = red.walk(&v, None);
+    out["note"] = "Candidates to check against the certificates and the pre-filled return, not entitlements: never present an amount as tax saved, never quote or look up a rate or ceiling, and end with the disclaimer. Assets and loans are refs (asset-N, loan-N), children pseudonyms.".into(); Ok(out)
+}

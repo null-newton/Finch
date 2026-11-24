@@ -27,7 +27,7 @@ financial life: treat every figure, name and merchant as private. **Numbers come
   with the Python app) -> `classify/` (`parsers/belgian.rs`, `rules.rs` + `assets/rules.yaml`, `llm.rs`, `batch.rs`) -> `analytics/`
   (pure functions over a `Dataset`), `transfers.rs`, `insights.rs`, `alerts.rs`.
 - **Household & memory**: `memory.rs` (read-only), `memstore.rs` (the ONLY writer), `proposals.rs`, `questions.rs`, `qgen.rs`,
-  `household.rs`, `docs.rs`. Wealth: `loans.rs`, `loans_extra.rs`, `rental.rs`, `subs.rs`, `subs_extra.rs`.
+  `household.rs`, `docs.rs`. Wealth: `loans.rs`, `loans_extra.rs`, `rental.rs`, `subs.rs`, `subs_extra.rs`; `tax.rs` (Belgian tax-return candidates). Legal wording: `disclaimers.rs`.
 - **Boundaries**: `privacy/` (redaction, guard), `mcp/` (stdio server; tools in `mod.rs`, `memory_tools.rs`, `wealth_tools.rs`, `people.rs`;
   every output through `Session::publish`), `web/` (`finch ui`: `mod.rs` server + security, `routes.rs` / `memory_routes.rs` API under
   `/api/v1`, unported ones answer 404 `not_ported`), `egress.rs` + `net.rs` (every outbound call; traits so tests inject fakes),
