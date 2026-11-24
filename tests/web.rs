@@ -121,6 +121,35 @@ fn endpoints() {
     let _ = web::API;
 }
 
+#[test]
+fn insight_states() {
+    let tmp = tempfile::tempdir().unwrap(); let mut a = app(tmp.path()); a.today = chrono::NaiveDate::from_ymd_opt(2025, 4, 20); let c = C::login(&a, None);
+    let feed = c.get("/api/v1/insights"); let cards = feed["cards"].as_array().unwrap().clone();
+    let b = cards.iter().find(|x| x["kind"] == "budget").unwrap_or_else(|| panic!("a budget card: {feed}"))["id"].as_str().unwrap().to_string(); assert!(feed["cards"][0]["snoozed_until"].is_null());
+    let kinds: std::collections::BTreeSet<&str> = cards.iter().filter_map(|x| x["kind"].as_str()).collect(); assert!(kinds.contains("budget") && kinds.contains("forecast"), "{kinds:?}");
+    let ids = |v: &Value| v["cards"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // a budget card (ui-state.json): dismiss hides it, restore brings it back
+    let (s, v) = c.call("POST", &format!("/api/v1/insights/{b}/dismiss"), Some(json!({}))); assert_eq!((s, v["dismissed"].as_bool()), (200, Some(true)), "{v}");
+    let f = c.get("/api/v1/insights"); assert!(!ids(&f).contains(&b)); assert_eq!(f["hidden"].as_u64().unwrap(), feed["hidden"].as_u64().unwrap() + 1);
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(tmp.path().join("data/ui-state.json")).unwrap()).unwrap(); assert_eq!(st["dismissed"], json!([b]), "Python-compatible ui-state.json");
+    assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/restore"), Some(json!({}))).1["restored"], true); assert!(ids(&c.get("/api/v1/insights")).contains(&b));
+    // snooze: hidden until the date, shown with include_snoozed and its date
+    let (s, v) = c.call("POST", &format!("/api/v1/insights/{b}/snooze"), Some(json!({"days": 3}))); assert_eq!((s, v["snoozed_until"].as_str()), (200, Some("2025-04-23")), "{v}");
+    assert!(!ids(&c.get("/api/v1/insights")).contains(&b)); let inc = c.get("/api/v1/insights?include_snoozed=true"); assert_eq!(inc["cards"].as_array().unwrap().iter().find(|x| x["id"] == b.as_str()).unwrap()["snoozed_until"], "2025-04-23");
+    assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/snooze"), Some(json!({"days": 999}))).0, 422);
+    c.call("POST", &format!("/api/v1/insights/{b}/restore"), Some(json!({})));
+    // every other card kind (anomaly, price change, forecast) can be dismissed and restored too
+    for k in cards.iter().filter(|x| x["id"] != b.as_str()) { let id = k["id"].as_str().unwrap();
+        let (s, v) = c.call("POST", &format!("/api/v1/insights/{id}/done"), Some(json!({}))); assert_eq!(s, 200, "{} {v}", k["kind"]); assert!(!ids(&c.get("/api/v1/insights")).contains(&id.to_string()), "{}", k["kind"]);
+        c.call("POST", &format!("/api/v1/insights/{id}/restore"), Some(json!({}))); assert!(ids(&c.get("/api/v1/insights")).contains(&id.to_string()), "{} restored", k["kind"]); }
+    assert_eq!(c.call("POST", "/api/v1/insights/ins_0000000000/dismiss", Some(json!({}))).0, 404); assert_eq!(c.call("POST", &format!("/api/v1/insights/{b}/read"), Some(json!({}))).0, 404);
+    // the coach's own insights: status in the database
+    db::connect(&a.cfg, db::Opts { insecure: true, ..Default::default() }).unwrap().execute("INSERT INTO insights(id, created, kind, title, body, status) VALUES ('cin_1', '2025-04-19', 'answer', 't', 'b', 'new')", []).unwrap();
+    assert_eq!(c.call("POST", "/api/v1/insights/cin_1/snooze", Some(json!({"days": 2}))).1["snoozed_until"], "2025-04-22"); assert!(c.get("/api/v1/insights")["coach"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(c.get("/api/v1/insights?include_snoozed=true")["coach"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(c.call("POST", "/api/v1/insights/cin_1/restore", Some(json!({}))).1["status"], "new"); assert_eq!(c.get("/api/v1/insights")["coach"]["items"].as_array().unwrap().len(), 1);
+}
+
 fn git_ok() -> bool { std::process::Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success()) }
 #[test]
 fn memory_lists_and_health() {

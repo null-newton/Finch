@@ -51,6 +51,25 @@ pub fn coach_items(con: &Connection, today: chrono::NaiveDate, include_hidden: b
     let n = rows.len(); let items: Vec<Value> = rows.into_iter().filter(|x| include_hidden || visible(x)).collect(); let hidden = n - items.len(); Ok((items, hidden))
 }
 pub fn coach_set(con: &Connection, id: &str, action: &str, days: i64, today: chrono::NaiveDate) -> anyhow::Result<bool> {
-    let (st, until) = match action { "read" => ("read", None), "done" => ("done", None), "dismiss" => ("dismissed", None), "snooze" => ("snoozed", Some((today + chrono::Duration::days(days.clamp(1, 365))).to_string())), _ => anyhow::bail!("unknown action {action:?}") };
+    let (st, until) = match action { "read" => ("read", None), "done" => ("done", None), "dismiss" => ("dismissed", None), "restore" => ("new", None), "snooze" => ("snoozed", Some((today + chrono::Duration::days(days.clamp(1, 365))).to_string())), _ => anyhow::bail!("unknown action {action:?}") };
     Ok(con.execute("UPDATE insights SET status=?, snoozed_until=? WHERE id=?", rusqlite::params![st, until, id])? > 0)
+}
+
+/// `<data_dir>/ui-state.json` (owner-only), shared with the Python app: the cards the user snoozed (id -> until) or dismissed.
+/// Presentation state only; anomalies and price changes are dismissed in the database.
+pub struct UiState(pub std::path::PathBuf);
+static UI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl UiState {
+    pub fn new(cfg: &crate::config::Config) -> Self { Self(cfg.data_dir.join("ui-state.json")) }
+    fn load(&self) -> Value { std::fs::read_to_string(&self.0).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or(json!({})) }
+    fn update(&self, f: impl FnOnce(&mut Value)) -> anyhow::Result<()> {
+        let _g = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner()); let mut d = self.load(); f(&mut d);
+        let mut m: Vec<(String, Value)> = d.as_object().cloned().unwrap_or_default().into_iter().collect(); m.sort_by(|x, y| x.0.cmp(&y.0));
+        crate::memstore::atomic_write(&self.0, &serde_json::to_string_pretty(&m.into_iter().collect::<serde_json::Map<_, _>>())?)
+    }
+    pub fn snoozed(&self, today: chrono::NaiveDate) -> std::collections::BTreeMap<String, String> { let t = today.to_string(); self.load()["snoozed"].as_object().into_iter().flatten().filter_map(|(k, v)| v.as_str().filter(|v| *v >= t.as_str()).map(|v| (k.clone(), v.to_string()))).collect() }
+    pub fn dismissed(&self) -> HashSet<String> { self.load()["dismissed"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect() }
+    pub fn snooze(&self, id: &str, until: chrono::NaiveDate) -> anyhow::Result<()> { self.update(|d| { if !d["snoozed"].is_object() { d["snoozed"] = json!({}); } d["snoozed"][id] = until.to_string().into(); }) }
+    pub fn dismiss(&self, id: &str) -> anyhow::Result<()> { self.update(|d| { let mut s: Vec<String> = d["dismissed"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).chain([id.to_string()]).collect(); s.sort(); s.dedup(); d["dismissed"] = json!(s); }) }
+    pub fn unsnooze(&self, id: &str) -> anyhow::Result<()> { self.update(|d| { if let Some(m) = d["snoozed"].as_object_mut() { m.remove(id); } let s: Vec<Value> = d["dismissed"].as_array().into_iter().flatten().filter(|x| *x != id).cloned().collect(); d["dismissed"] = s.into(); }) }
 }
