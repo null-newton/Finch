@@ -20,7 +20,7 @@ What is left after phase 5d. Each item says who can move it: **[agent]** can be 
 - **B4 Web endpoint parity [agent].** List every endpoint `web/src/api/hooks.ts` and the pages call that answers 404 `not_ported`
   in `src/web/routes.rs` / `memory_routes.rs`, then port them one by one (incl. dismissing every insight kind, not only anomalies and
   price changes). Each new endpoint gets a test in `tests/web.rs`; a child-visible one goes into `CHILD_ALLOWED` on purpose only.
-- **B5 MCP tool parity [agent].** The Python server has tools finch lacks (e.g. `explain_transaction`, `memory_context`,
+- **B5 MCP tool parity [agent; in progress 2026-11-24: fixes + `savings_estimate`, `mortgage_check` (BE), `explain_transaction`, `monthly_review`, `explain_spike`, `subscription_audit`, `onboarding_status` done, each with a leak assertion in `tests/e2e.rs`; left: `memory_context`, `add_insight`, `what_if`; the coach skill prompts in `coach.rs` can now name the new tools].** The Python server has tools finch lacks (e.g. `explain_transaction`, `memory_context`,
   `monthly_review`, `explain_spike`, `what_if`, `mortgage_check`, `savings_estimate`, `subscription_audit`, `onboarding_status`).
   Audit against `../src/coach/mcp/`, port the missing ones through `mcp::Session::publish`, a leak assertion each in `tests/e2e.rs`.
   `tax_candidates` is excluded until B9 is decided.

@@ -66,6 +66,15 @@ pub fn tools() -> Vec<Tool> {
             schema: plain(json!({"loan": {"type": "string", "maxLength": 20, "description": "loan-N (default: every mortgage)"}, "market_rate_pct": {"type": "number", "minimum": 0, "maximum": 25}, "market_rate_date": date, "variant": {"type": "string", "enum": ["internal", "external"]},
                 "bank_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "guarantee_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "other_fees": {"type": "number", "minimum": 0, "maximum": 100000}, "penalty": {"type": "number", "minimum": 0, "maximum": 1000000, "description": "the early-repayment indemnity the contract states, instead of the legal cap"},
                 "alternative_insurance_monthly": {"type": "number", "minimum": 0, "maximum": 10000}, "insurance_fees": {"type": "number", "minimum": 0, "maximum": 10000}})) },
+        Tool { name: "explain_transaction", description: format!("Why a transaction has its category: the redacted decision chain (override, transfer link, type rule, the user's merchant label, merchant rule, canonical merchant, automatic label), the memory annotations that match, a split, and whose it is (a pseudonym and the kind of reason). Any `h_` ref of the data.{DATA_NOTE}"),
+            schema: json!({"type": "object", "properties": {"tx_ref": {"type": "string", "pattern": r"^h_[0-9a-f]{10}$"}}, "required": ["tx_ref"], "additionalProperties": false}) },
+        Tool { name: "monthly_review", description: format!("Monthly review of one month (default the last closed one): cash flow (income, spending, saved, to and from savings accounts), the biggest movers against usual with evidence refs (transactions, rec_ series, anm_ anomalies, chg_ price changes), one-offs apart, budgets at month end and the forecast flags. All numbers are computed.{DATA_NOTE}"),
+            schema: plain(json!({"month": month, "top": {"type": "integer", "minimum": 1, "maximum": 15}, "member": member})) },
+        Tool { name: "explain_spike", description: format!("Why was a category, a group or an account high in a month? Splits the month into one-off, recurring, new-merchant and habitual spending, each merchant's change against its own usual, the top transactions (refs), and the same month a year earlier when covered. Give `category` (id or group) OR `account`.{DATA_NOTE}"),
+            schema: plain(json!({"category": {"type": "string", "maxLength": 80, "description": "category id or group, e.g. 'food.groceries' or 'food'"}, "account": {"type": "string", "maxLength": 60, "description": "account pseudonym, e.g. 'account-main-1'"}, "month": month, "member": member})) },
+        Tool { name: "subscription_audit", description: format!("Every active recurring cost by group (telecom, energy and water, insurance, subscriptions, health): monthly and yearly cost, price rises, duplicates and overlaps, contracts on file, unknown usage, and ranked review candidates with expected yearly savings ranges (fixed heuristic shares, not quotes). Never advises cancelling.{DATA_NOTE}"),
+            schema: plain(json!({"limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "review candidates listed (default 10)"}, "items_limit": {"type": "integer", "minimum": 1, "maximum": 60, "description": "services listed in detail, biggest first (default 20)"}})) },
+        Tool { name: "onboarding_status", description: format!("Checklist of what the coach still does not know: household and privacy declarations, account owners and purposes, loans (the fields mortgage_check needs), contracts, preferences, budgets, open questions, with the next actions.{DATA_NOTE}"), schema: plain(json!({})) },
     ]
 }
 
@@ -122,6 +131,8 @@ impl Session {
                 "savings_tracker" => wealth_tools::savings_tracker(&rec, red, con, today), _ => Ok(wealth_tools::subscriptions(ds, &rec, red, con, a)) }; }
             "decision_propose" | "contracts_draft" => { if self.proposals >= memory_tools::MAX_PROPOSALS { return Err(format!("at most {} proposals per session: ask the user to review the pending ones first", memory_tools::MAX_PROPOSALS)); } let rec = recurring::detect(ds, &Scope::default(), true);
                 let r = if name == "decision_propose" { wealth_tools::decision_propose(ds, &rec, red, con, a) } else { wealth_tools::contracts_draft(ds, &rec, red, &self.cfg, a) }; if r.is_ok() { self.proposals += 1; } return r; } _ => {} }
+        match name { "explain_transaction" => return skill_tools::explain_transaction(ds, red, con, &self.cfg, a), "onboarding_status" => return skill_tools::onboarding_status(ds, red, &self.cfg, &recurring::detect(ds, &Scope::default(), true)),
+            "subscription_audit" => return skill_tools::subscription_audit(ds, red, con, &self.cfg, &recurring::detect(ds, &Scope::default(), true), a), _ => {} }
         match name { "household_overview" => return Ok(people::overview(ds, red, con)), "kids_money" => return people::kids(ds, red, con, a), "who_pays" => return Ok(people::who_pays(ds, red, a)), _ => {} }
         let view; let ds = match a["member"].as_str() { Some(m) => { let id = people::rev(red, m).filter(|i| i == crate::household::JOINT || ds.people.get(i).is_some()).ok_or("unknown member: use a member pseudonym from household_overview (adult-N, kid-N, joint)")?; view = ds.member_view(&id); &view } None => ds };
         let date = |k: &str| a[k].as_str().map(|v| crate::util::d(v).ok_or(format!("{v:?} is not a date (YYYY-MM-DD)"))).transpose();
@@ -140,6 +151,8 @@ impl Session {
             "category_averages" => category_averages(ds, &scope, a["window"].as_u64().map(|x| x as usize)),
             "cashflow" => cashflow(ds, &scope, a["months"].as_u64().unwrap_or(6) as usize, a["end_month"].as_str(), a["include_current"].as_bool().unwrap_or(false), a["breakdown"].as_bool().unwrap_or(true)),
             "transactions_search" => return search(ds, red, &scope, a),
+            "monthly_review" => return skill_tools::monthly_review(ds, red, con, &recurring::detect(ds, &Scope::default(), true), a),
+            "explain_spike" => return skill_tools::explain_spike(ds, red, &self.cfg, &recurring::detect(ds, &Scope::default(), true), a),
             _ => unreachable!(),
         };
         Ok(red.walk(&raw, None))
