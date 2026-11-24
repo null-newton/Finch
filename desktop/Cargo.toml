@@ -1,0 +1,36 @@
+[package]
+name = "finch-desktop"
+version = "0.1.0"
+description = "Finch desktop app: the finch web app in its own window, with an installer and signed updates"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "finch-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+finch = { path = ".." }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+url = "2"
+serde_json = "1"
+
+[features]
+# The released app encrypts the database (SQLCipher, needs perl + a C toolchain) and keeps secrets in the OS keychain;
+# `--no-default-features` builds a plain one for local tries on a scratch home
+default = ["secure"]
+secure = ["finch/sqlcipher", "finch/keychain"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

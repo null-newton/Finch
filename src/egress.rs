@@ -7,7 +7,8 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection};
 
 /// (kind, external, local_only behaviour, offline behaviour, redaction mode, default host)
-pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 10] = [
+pub const FLOWS: [(&str, bool, &str, &str, &str, &str); 11] = [
+    ("update.github", true, "refused", "refused", "none", "github.com (the desktop app's signed update check: sends no data)"),
     ("alerts.email", true, "refused", "refused", "minimal-guarded", "the SMTP server of [alerts.email] host"),
     ("alerts.macos", false, "allowed", "allowed", "minimal-guarded", "this Mac (notification centre)"),
     ("alerts.ntfy", true, "refused", "refused", "minimal-guarded", "the ntfy server of [alerts.ntfy] url"),

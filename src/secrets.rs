@@ -32,8 +32,16 @@ fn read_file(name: &str) -> Result<Option<String>> {
     if !p.is_file() { bail!("{} is not a regular file.", p.display()); }
     check_mode(&p, false)?; let v = std::fs::read_to_string(&p)?.trim().to_string(); Ok((!v.is_empty()).then_some(v))
 }
+/// The keychain service: `COACH_KEYCHAIN_SERVICE` keeps one home's secrets apart (the desktop app uses its own).
+pub fn service() -> String { env::var("COACH_KEYCHAIN_SERVICE").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| SERVICE.into()) }
+/// Keeps a secret in the OS keychain (the keychain build only).
+pub fn store(name: &str, value: &str) -> Result<()> { var_of(name)?; store_kc(name, value) }
 #[cfg(feature = "keychain")]
-fn keychain(name: &str) -> Result<Option<String>> { match keyring::Entry::new(SERVICE, name)?.get_password() { Ok(v) => Ok(Some(v)), Err(keyring::Error::NoEntry) => Ok(None), Err(e) => bail!("Cannot read secret '{name}' from the keychain ({e}).") } }
+fn store_kc(name: &str, value: &str) -> Result<()> { keyring::Entry::new(&service(), name)?.set_password(value).map_err(|e| anyhow::anyhow!("Cannot store secret '{name}' in the keychain ({e}).")) }
+#[cfg(not(feature = "keychain"))]
+fn store_kc(name: &str, _: &str) -> Result<()> { bail!("this build has no keychain support: provide '{name}' as its environment variable") }
+#[cfg(feature = "keychain")]
+fn keychain(name: &str) -> Result<Option<String>> { match keyring::Entry::new(&service(), name)?.get_password() { Ok(v) => Ok(Some(v)), Err(keyring::Error::NoEntry) => Ok(None), Err(e) => bail!("Cannot read secret '{name}' from the keychain ({e}).") } }
 #[cfg(not(feature = "keychain"))]
 fn keychain(_: &str) -> Result<Option<String>> { Ok(None) }
 
@@ -48,7 +56,7 @@ pub fn get_secret(name: &str, required: bool) -> Result<Option<String>> {
     if !required { return Ok(None); }
     let var = var_of(name)?;
     if backend()? == "file" { bail!("Secret '{name}' not found. Provide it as the environment variable {var} or as the file {} (mode 0600, the value only).", secrets_dir().join(name).display()); }
-    bail!("Secret '{name}' not found. Provide it as the environment variable {var}{}.", if cfg!(feature = "keychain") { format!(" or in the OS keychain (service '{SERVICE}')") } else { " (this build has no keychain support: build with --features keychain, or use COACH_SECRETS_BACKEND=file)".into() })
+    bail!("Secret '{name}' not found. Provide it as the environment variable {var}{}.", if cfg!(feature = "keychain") { format!(" or in the OS keychain (service '{}')", service()) } else { " (this build has no keychain support: build with --features keychain, or use COACH_SECRETS_BACKEND=file)".into() })
 }
 /// (name, masked status) per known secret: never the value.
 pub fn describe() -> Vec<(String, String)> {

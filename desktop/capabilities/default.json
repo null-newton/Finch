@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The window shows finch's own local web app: it gets no access to the Tauri API (updates are checked from Rust)",
+  "windows": ["main"],
+  "permissions": []
+}

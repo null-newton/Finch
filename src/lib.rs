@@ -18,6 +18,7 @@ pub mod transfers;
 pub mod usage;
 pub mod mcp;
 pub mod privacy;
+pub mod home;
 pub mod household;
 pub mod insights;
 pub mod loans;

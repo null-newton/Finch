@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Finch",
+  "mainBinaryName": "finch-desktop",
+  "identifier": "be.finch.desktop",
+  "build": {
+    "frontendDist": "splash"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Finance",
+    "shortDescription": "Private personal-finance coach for one household",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/finch"],
+    "resources": { "../static/": "static/" },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY1QjIwMDdCMTA2NkI0MTAKUldRUXRHWVFld0N5Wlh1OS9vczFTVHZJN296RkRoZUVvT0xSTG1sc1YvbExQSWpuSW5FOFdOb1MK",
+      "endpoints": [
+        "https://github.com/null-newton/Finch/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

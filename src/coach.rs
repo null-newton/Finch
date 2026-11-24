@@ -81,7 +81,7 @@ pub fn run_skill(cfg: &Config, insecure: bool, skill: &str, question: &str, sp: 
     egress::allow(con, cfg, "llm.claude-code", "", question.len() + SYSTEM.len(), "coach.ask")?;
     if !sp.which() { bail!("the `claude` command is not installed or not in PATH"); }
     let dir = std::env::temp_dir().join(format!("finch-coach-{:08x}", rand::random::<u32>())); std::fs::create_dir_all(&dir)?;
-    let exe = std::env::current_exe()?.to_string_lossy().to_string(); let mut args: Vec<String> = vec![]; if insecure { args.push("--insecure".into()); } if let Some(p) = &cfg.config_path { args.extend(["--config".into(), p.display().to_string()]); } args.extend(["mcp".into(), "serve".into()]);
+    let exe = std::env::var("FINCH_CLI").ok().filter(|p| std::path::Path::new(p).is_file()).map_or_else(|| std::env::current_exe().map(|e| e.to_string_lossy().to_string()), Ok)?; let mut args: Vec<String> = vec![]; if insecure { args.push("--insecure".into()); } if let Some(p) = &cfg.config_path { args.extend(["--config".into(), p.display().to_string()]); } args.extend(["mcp".into(), "serve".into()]);
     let fenv: serde_json::Map<String, Value> = FORWARD.iter().filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), json!(v)))).chain(ENV_ALLOW.iter().filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), json!(v))))).collect();
     let mcp = dir.join("mcp.json"); crate::memstore::atomic_write(&mcp, &json!({"mcpServers": {"finance": {"command": exe, "args": args, "env": fenv}}}).to_string())?;
     let allowed: Vec<String> = spec.tool_names().into_iter().map(|t| format!("{MCP_PREFIX}{t}")).collect(); let max = cfg.coach_max_tool_calls * spec.tool_factor;

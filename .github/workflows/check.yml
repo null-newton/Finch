@@ -1,0 +1,32 @@
+# Fast sanity check on every push/PR: typecheck, test and build the web app, lint and test the Rust program, lint the desktop app (Linux only)
+name: check
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency: { group: 'check-${{ github.ref }}', cancel-in-progress: true }
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: web/package.json }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: web/pnpm-lock.yaml }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: ". -> target\ndesktop -> target" }
+      - run: for i in 1 2 3; do sudo timeout 300 apt-get update && sudo timeout 300 apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf && exit 0; echo "apt attempt $i failed, retrying"; sleep 10; done; exit 1
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm test
+        working-directory: web
+      - run: pnpm build
+        working-directory: web
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # the plain build (no SQLCipher / keychain); tauri-build only checks that the bundled command line exists, so a placeholder does
+      - run: mkdir -p binaries && touch binaries/finch-x86_64-unknown-linux-gnu && cargo clippy --no-default-features -- -D warnings
+        working-directory: desktop

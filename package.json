@@ -1,0 +1,14 @@
+{
+  "name": "finch-release",
+  "private": true,
+  "description": "Release and desktop tooling only: the web app lives in web/ (pnpm), the program in Cargo.toml, the desktop app in desktop/",
+  "scripts": {
+    "release": "node scripts/release.mjs",
+    "tauri": "tauri",
+    "desktop": "node scripts/sidecar.mjs && tauri dev -c desktop/tauri.conf.json",
+    "bundle": "node scripts/sidecar.mjs && tauri build -c desktop/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

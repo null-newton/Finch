@@ -13,3 +13,8 @@ web/node_modules/
 web/dist/
 .claude/settings.local.json
 /static/
+
+/desktop/target/
+/desktop/gen/
+/desktop/binaries/
+/node_modules/
